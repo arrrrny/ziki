@@ -17,6 +17,14 @@ const SearchTool = @import("tool/search.zig").SearchTool;
 const WriteTool = @import("tool/write.zig").WriteTool;
 const BashTool = @import("tool/bash.zig").BashTool;
 
+const Intent = @import("shell/intent.zig").Intent;
+const Result = @import("shell/intent.zig").Result;
+const Handler = @import("shell/handler.zig").Handler;
+const Dispatcher = @import("shell/dispatcher.zig").Dispatcher;
+const parser = @import("shell/parser.zig");
+const Repl = @import("shell/repl.zig");
+const Output = @import("shell/repl.zig").Output;
+
 const SESSION_ID = "default";
 
 fn emit(comptime fmt: []const u8, args: anytype) !void {
@@ -29,7 +37,6 @@ fn emitErr(msg: []const u8) !void {
     try std.fs.File.stdout().writeAll(msg);
     try std.fs.File.stdout().writeAll("\n");
 }
-
 fn emitStatus(status: Status) !void {
     try emit("status: {s}", .{status.jsonString()});
 }
@@ -43,7 +50,6 @@ fn emitSummary(goal: *const Goal) !void {
 fn sessionProviderPath(alloc: Allocator, state_dir: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ state_dir, "provider.txt" });
 }
-
 fn readSessionProvider(alloc: Allocator, state_dir: []const u8) !?[]const u8 {
     const p = try sessionProviderPath(alloc, state_dir);
     defer alloc.free(p);
@@ -57,12 +63,16 @@ fn readSessionProvider(alloc: Allocator, state_dir: []const u8) !?[]const u8 {
     alloc.free(raw);
     return owned;
 }
-
 fn writeSessionProvider(alloc: Allocator, state_dir: []const u8, name: []const u8) !void {
     const p = try sessionProviderPath(alloc, state_dir);
     defer alloc.free(p);
     try std.fs.cwd().writeFile(.{ .sub_path = p, .data = name });
 }
+
+// ---------------------------------------------------------------------------
+// Command handlers. Each wraps the existing logic behind the Handler interface
+// so the dispatcher stays command-agnostic (SC-005, DIP).
+// ---------------------------------------------------------------------------
 
 fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs) !void {
     if (tokens.len < 2) {
@@ -186,6 +196,20 @@ fn runStatus(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
     try emit("turns:     {d}/{d}", .{ goal.used.turns, goal.budgets.max_turns });
 }
 
+fn runGoals(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
+    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
+    const repo = repo_impl.toRepository();
+    const g = repo.load(alloc) catch null;
+    if (g == null) {
+        try emit("no active goal", .{});
+        return;
+    }
+    var goal = g.?;
+    defer goal.deinit(alloc);
+    try emit("goal: {s}", .{goal.objective});
+    try emitStatus(goal.status);
+}
+
 fn runProvider(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8) !void {
     if (tokens.len < 2) {
         const p = try readSessionProvider(alloc, state_dir);
@@ -202,56 +226,87 @@ fn runProvider(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8) !v
     try emit("active provider set to {s}", .{name});
 }
 
-fn dispatch(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs) !void {
-    const command = tokens[0];
-    if (std.mem.eql(u8, command, "/goal")) {
-        try runGoal(alloc, tokens, state_dir, fs_iface);
-    } else if (std.mem.eql(u8, command, "/stop")) {
-        try runStop(alloc, state_dir);
-    } else if (std.mem.eql(u8, command, "/status")) {
-        try runStatus(alloc, state_dir, fs_iface);
-    } else if (std.mem.eql(u8, command, "/provider")) {
-        try runProvider(alloc, tokens, state_dir);
-    } else {
-        try emitErr("unknown command — supported: /goal, /stop, /status, /provider");
-    }
+// --- Handler context structs + vtable bindings ---
+
+const GoalCtx = struct { state_dir: []const u8, fs: Fs };
+const StopCtx = struct { state_dir: []const u8 };
+const ProviderCtx = struct { state_dir: []const u8 };
+const StatusCtx = struct { state_dir: []const u8, fs: Fs };
+const GoalsCtx = struct { state_dir: []const u8, fs: Fs };
+const HelpCtx = struct {};
+
+fn goalHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *GoalCtx = @ptrCast(@alignCast(ctx_));
+    var toks = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+    defer toks.deinit(alloc);
+    try toks.append(alloc, "/goal");
+    var it = std.mem.tokenizeScalar(u8, intent.args, ' ');
+    while (it.next()) |t| try toks.append(alloc, t);
+    runGoal(alloc, toks.items, self.state_dir, self.fs) catch {};
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
+fn stopHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *StopCtx = @ptrCast(@alignCast(ctx_));
+    _ = intent;
+    runStop(alloc, self.state_dir) catch {};
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
+fn providerHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *ProviderCtx = @ptrCast(@alignCast(ctx_));
+    var toks = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+    defer toks.deinit(alloc);
+    try toks.append(alloc, "/provider");
+    var it = std.mem.tokenizeScalar(u8, intent.args, ' ');
+    while (it.next()) |t| try toks.append(alloc, t);
+    runProvider(alloc, toks.items, self.state_dir) catch {};
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
+fn statusHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *StatusCtx = @ptrCast(@alignCast(ctx_));
+    _ = intent;
+    runStatus(alloc, self.state_dir, self.fs) catch {};
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
+fn goalsHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *GoalsCtx = @ptrCast(@alignCast(ctx_));
+    _ = intent;
+    runGoals(alloc, self.state_dir, self.fs) catch {};
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
+fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
+    try emit("commands:", .{});
+    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>]", .{});
+    try emit("  /stop", .{});
+    try emit("  /status", .{});
+    try emit("  /goals", .{});
+    try emit("  /provider [name]", .{});
+    try emit("  /help", .{});
+    return Result{ .output = try std.heap.page_allocator.dupe(u8, "") };
 }
 
-/// Reads one line (without the trailing newline) from a 0.15 `std.Io.Reader`.
-/// Returns `null` at end of stream.
-fn readLine(alloc: Allocator, r: *std.Io.Reader) !?[]u8 {
-    var line = try std.ArrayList(u8).initCapacity(alloc, 0);
-    var chunk: [1024]u8 = undefined;
-    while (true) {
-        const n = r.readSliceShort(&chunk) catch break;
-        for (chunk[0..n]) |b| {
-            if (b == '\n') return try line.toOwnedSlice(alloc);
-            try line.append(alloc, b);
-        }
-    }
-    if (line.items.len == 0) return null;
-    return try line.toOwnedSlice(alloc);
+const goal_vtable = Handler.VTable{ .handle = goalHandle };
+const stop_vtable = Handler.VTable{ .handle = stopHandle };
+const provider_vtable = Handler.VTable{ .handle = providerHandle };
+const status_vtable = Handler.VTable{ .handle = statusHandle };
+const goals_vtable = Handler.VTable{ .handle = goalsHandle };
+const help_vtable = Handler.VTable{ .handle = helpHandle };
+
+// --- REPL output sink: stdout ---
+
+var stdout_ctx: u8 = 0;
+fn stdoutWrite(_: *anyopaque, data: []const u8) void {
+    std.fs.File.stdout().writeAll(data) catch {};
+}
+const stdout_output = Output{ .ctx = &stdout_ctx, .vtable = &.{ .write = stdoutWrite } };
+
+fn stdinRead(ctx: *std.fs.File, buf: []u8) error{}!usize {
+    return ctx.read(buf) catch 0;
 }
 
-fn repl(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
-    var stdin_buf: [8192]u8 = undefined;
-    var stdin = std.fs.File.stdin().reader(&stdin_buf).interface;
-    while (true) {
-        try std.fs.File.stdout().writeAll("ziki> ");
-        const line = readLine(alloc, &stdin) catch break;
-        if (line == null) break;
-        defer alloc.free(line.?);
-        const trimmed = std.mem.trim(u8, line.?, " \t\r\n");
-        if (trimmed.len == 0) continue;
-
-        var tokens = try std.ArrayList([]const u8).initCapacity(alloc, 0);
-        defer tokens.deinit(alloc);
-        var it = std.mem.tokenizeScalar(u8, trimmed, ' ');
-        while (it.next()) |tok| try tokens.append(alloc, tok);
-        if (tokens.items.len == 0) continue;
-
-        dispatch(alloc, tokens.items, state_dir, fs_iface) catch {};
-    }
+fn runRepl(alloc: Allocator, dispatcher: *Dispatcher) !void {
+    var stdin_file = std.fs.File.stdin();
+    const stdin = std.io.GenericReader(*std.fs.File, error{}, stdinRead){ .context = &stdin_file };
+    try Repl.run(alloc, stdin, stdout_output, dispatcher, "ziki> ");
 }
 
 fn usage() !void {
@@ -259,6 +314,7 @@ fn usage() !void {
     try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>]", .{});
     try emit("  ziki /status", .{});
     try emit("  ziki /stop", .{});
+    try emit("  ziki /goals", .{});
     try emit("  ziki /provider [name]", .{});
     try emit("  ziki            (interactive REPL)", .{});
 }
@@ -280,16 +336,40 @@ pub fn main() !void {
     var realfs_impl = RealFs.init(cwd);
     const fs_iface = realfs_impl.toFs();
 
+    // Composition root: build the dispatcher and inject the handlers.
+    var gh = GoalCtx{ .state_dir = state_dir, .fs = fs_iface };
+    var sh = StopCtx{ .state_dir = state_dir };
+    var ph = ProviderCtx{ .state_dir = state_dir };
+    var st = StatusCtx{ .state_dir = state_dir, .fs = fs_iface };
+    var gl = GoalsCtx{ .state_dir = state_dir, .fs = fs_iface };
+    var hp = HelpCtx{};
+
+    var dispatcher = Dispatcher.init(alloc);
+    defer dispatcher.deinit();
+    try dispatcher.register("goal", .{ .ctx = &gh, .vtable = &goal_vtable });
+    try dispatcher.register("stop", .{ .ctx = &sh, .vtable = &stop_vtable });
+    try dispatcher.register("provider", .{ .ctx = &ph, .vtable = &provider_vtable });
+    try dispatcher.register("status", .{ .ctx = &st, .vtable = &status_vtable });
+    try dispatcher.register("goals", .{ .ctx = &gl, .vtable = &goals_vtable });
+    try dispatcher.register("help", .{ .ctx = &hp, .vtable = &help_vtable });
+
     if (args.len < 2) {
-        try repl(alloc, state_dir, fs_iface);
+        try runRepl(alloc, &dispatcher);
         return;
     }
     if (!std.mem.startsWith(u8, args[1], "/")) {
         try usage();
         return;
     }
-    var cli_tokens = try alloc.alloc([]const u8, args.len - 1);
-    for (args[1..], 0..) |a, i| cli_tokens[i] = a;
-    defer alloc.free(cli_tokens);
-    try dispatch(alloc, cli_tokens, state_dir, fs_iface);
+    const line = try std.mem.join(alloc, " ", args[1..]);
+    defer alloc.free(line);
+    const intent = (try parser.parseLine(line)) orelse {
+        try emitErr("empty command");
+        return;
+    };
+    const result = dispatcher.dispatch(alloc, intent) catch |e| Result{
+        .output = try std.fmt.allocPrint(alloc, "error: {s}", .{@errorName(e)}),
+    };
+    if (result.output.len > 0) try emit("{s}", .{result.output});
+    alloc.free(result.output);
 }
