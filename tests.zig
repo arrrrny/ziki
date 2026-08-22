@@ -17,6 +17,7 @@ const bash = @import("src/tool/bash.zig");
 const write = @import("src/tool/write.zig");
 const executor = @import("src/agent/executor.zig");
 const config = @import("src/config/config.zig");
+const shell_test = @import("src/shell/shell_test.zig");
 
 test "aggregator loads all modules" {
     _ = std.testing;

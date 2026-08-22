@@ -19,7 +19,7 @@ implementable and testable.
 
 ## Phase 1: Setup (Shared Infrastructure)
 
-- [ ] T001 Create the `src/shell/` module and register `src/shell/shell_test.zig` in `tests.zig` so `zig build test` executes the shell test suite
+- [X] T001 Create the `src/shell/` module and register `src/shell/shell_test.zig` in `tests.zig` so `zig build test` executes the shell test suite
 
 ---
 
@@ -27,8 +27,8 @@ implementable and testable.
 
 **⚠️ CRITICAL**: No user story work can begin until these types/interfaces exist.
 
-- [ ] T002 [P] Define `Intent` and `Result` types in `src/shell/intent.zig` (fields per data-model.md: command, args, raw / output, exit)
-- [ ] T003 [P] Define the `Handler` vtable interface (`ctx` + `VTable.handle(alloc, intent) !Result`) in `src/shell/handler.zig`
+- [X] T002 [P] Define `Intent` and `Result` types in `src/shell/intent.zig` (fields per data-model.md: command, args, raw / output, exit)
+- [X] T003 [P] Define the `Handler` vtable interface (`ctx` + `VTable.handle(alloc, intent) !Result`) in `src/shell/handler.zig`
 
 **Checkpoint**: Core types and the handler boundary exist — user stories can begin.
 
@@ -45,11 +45,11 @@ provider, or filesystem involved.
 
 ### Tests for User Story 1 (WRITE FIRST — must FAIL before implementation)
 
-- [ ] T004 [P] [US1] Test (RED) `parseLine` in `src/shell/shell_test.zig`: slash commands parse to correct command+args; empty/whitespace → null; non-slash → `Intent{ command = "", args = text }`; `/` with no name or invalid chars → parse error
+- [X] T004 [P] [US1] Test (RED) `parseLine` in `src/shell/shell_test.zig`: slash commands parse to correct command+args; empty/whitespace → null; non-slash → `Intent{ command = "", args = text }`; `/` with no name or invalid chars → parse error
 
 ### Implementation for User Story 1
 
-- [ ] T005 [US1] Implement `parseLine` in `src/shell/parser.zig` to satisfy T004 (split command + trimmed remainder; no command-specific logic)
+- [X] T005 [US1] Implement `parseLine` in `src/shell/parser.zig` to satisfy T004 (split command + trimmed remainder; no command-specific logic)
 
 **Checkpoint**: US1 fully functional and testable on its own.
 
@@ -67,11 +67,11 @@ attempt duplicate registration, assert it is rejected.
 
 ### Tests for User Story 2 (WRITE FIRST — must FAIL before implementation)
 
-- [ ] T006 [P] [US2] Test (RED) `Dispatcher` in `src/shell/shell_test.zig`: only the matching handler is invoked; unknown command invokes none + returns clear result; duplicate `register` is rejected; `command = ""` routes to `default_handler` when set
+- [X] T006 [P] [US2] Test (RED) `Dispatcher` in `src/shell/shell_test.zig`: only the matching handler is invoked; unknown command invokes none + returns clear result; duplicate `register` is rejected; `command = ""` routes to `default_handler` when set
 
 ### Implementation for User Story 2
 
-- [ ] T007 [US2] Implement `Dispatcher` (`register` + `dispatch` + optional `default_handler`) in `src/shell/dispatcher.zig` to satisfy T006
+- [X] T007 [US2] Implement `Dispatcher` (`register` + `dispatch` + optional `default_handler`) in `src/shell/dispatcher.zig` to satisfy T006
 
 **Checkpoint**: US1 + US2 (the core dispatcher) fully functional and testable.
 
@@ -89,12 +89,12 @@ outputs, loop ends on input exhaustion, no human required.
 
 ### Tests for User Story 3 (WRITE FIRST — must FAIL before implementation)
 
-- [ ] T008 [P] [US3] Test (RED) REPL in `src/shell/shell_test.zig`: scripted input produces expected ordered intents + outputs and terminates on EOF; empty line is ignored; `Result.exit` stops the loop
+- [X] T008 [P] [US3] Test (RED) REPL in `src/shell/shell_test.zig`: scripted input produces expected ordered intents + outputs and terminates on EOF; empty line is ignored; `Result.exit` stops the loop
 
 ### Implementation for User Story 3
 
-- [ ] T009 [US3] Implement the REPL loop over an injected line reader + output sink in `src/shell/repl.zig`
-- [ ] T010 [US3] Refactor `src/main.zig` into the composition root: build `Dispatcher`, register `goal`/`stop`/`provider`/`goals`/`help` handlers (adapt existing logic; add minimal `help` + `goals` handlers), and run the REPL via `src/shell`
+- [X] T009 [US3] Implement the REPL loop over an injected line reader + output sink in `src/shell/repl.zig`
+- [X] T010 [US3] Refactor `src/main.zig` into the composition root: build `Dispatcher`, register `goal`/`stop`/`provider`/`goals`/`help` handlers (adapt existing logic; add minimal `help` + `goals` handlers), and run the REPL via `src/shell`
 
 **Checkpoint**: Full feature shippable — REPL runs interactively and is
 scriptable; all five commands route correctly.
@@ -103,8 +103,8 @@ scriptable; all five commands route correctly.
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T011 [P] Run `specs/002-cli-shell-dispatcher/quickstart.md` validation (`zig build test` green; scripted REPL example)
-- [ ] T012 [P] Add edge-case unit tests (malformed message text, missing-arg command) to `src/shell/shell_test.zig` per contracts/cli-commands.md
+- [X] T011 [P] Run `specs/002-cli-shell-dispatcher/quickstart.md` validation (`zig build test` green; scripted REPL example)
+- [X] T012 [P] Add edge-case unit tests (malformed message text, missing-arg command) to `src/shell/shell_test.zig` per contracts/cli-commands.md
 
 ---
 
