@@ -68,7 +68,7 @@ doesn't ship.
 
 ```bash
 zig build
-zig build test      # 23 tests. all green. no exceptions.
+zig build test      # 33 tests. all green. no exceptions.
 ./zig-out/bin/ziki /goal "your objective" --provider cliproxy
 ```
 

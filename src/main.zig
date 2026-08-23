@@ -132,7 +132,10 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         return;
     }
 
-    var transport = HttpTransport.init(alloc);
+    var transport = HttpTransport.init(alloc, if (cfg.proxy.len > 0) cfg.proxy else null) catch {
+        try emitErr("invalid proxy URL in configuration");
+        return;
+    };
     defer transport.deinit();
     var prov_impl = presets.build(alloc, effective, cfg.endpoint, cfg.model, cfg.api_key, transport.toTransport()) catch {
         try emitErr("could not build provider");

@@ -9,6 +9,9 @@ pub const Config = struct {
     endpoint: []const u8,
     model: []const u8,
     api_key: []const u8,
+    /// Optional proxy URL. Empty means "no proxy" (direct connection). When set,
+    /// all provider requests are routed through it (spec 009).
+    proxy: []const u8,
 
     pub fn isValid(self: Config) bool {
         return presets.findPreset(self.active_provider) != null;
@@ -20,6 +23,7 @@ pub const Config = struct {
         alloc.free(self.endpoint);
         alloc.free(self.model);
         alloc.free(self.api_key);
+        alloc.free(self.proxy);
     }
 };
 
@@ -33,11 +37,13 @@ pub fn load(alloc: Allocator) !Config {
     var endpoint: []const u8 = "";
     var model: []const u8 = "";
     var api_key: []const u8 = "";
+    var proxy: []const u8 = "";
 
     if (env.get("ZIKI_PROVIDER")) |v| provider = v;
     if (env.get("ZIKI_ENDPOINT")) |v| endpoint = v;
     if (env.get("ZIKI_MODEL")) |v| model = v;
     if (env.get("ZIKI_API_KEY")) |v| api_key = v;
+    if (env.get("ZIKI_PROXY")) |v| proxy = v;
 
     // Config file overrides only when an env var is empty.
     const ov = loadFile(alloc) catch FileOverrides{};
@@ -46,11 +52,13 @@ pub fn load(alloc: Allocator) !Config {
         alloc.free(ov.endpoint);
         alloc.free(ov.model);
         alloc.free(ov.api_key);
+        alloc.free(ov.proxy);
     }
-    if (provider.len == 0) provider = ov.provider;
-    if (endpoint.len == 0) endpoint = ov.endpoint;
-    if (model.len == 0) model = ov.model;
-    if (api_key.len == 0) api_key = ov.api_key;
+    provider = resolve(provider, ov.provider);
+    endpoint = resolve(endpoint, ov.endpoint);
+    model = resolve(model, ov.model);
+    api_key = resolve(api_key, ov.api_key);
+    proxy = resolve(proxy, ov.proxy);
 
     if (provider.len == 0) return error.NoProviderConfigured;
     if (presets.findPreset(provider) == null) return error.UnknownProvider;
@@ -60,6 +68,7 @@ pub fn load(alloc: Allocator) !Config {
         .endpoint = try alloc.dupe(u8, endpoint),
         .model = try alloc.dupe(u8, model),
         .api_key = try alloc.dupe(u8, api_key),
+        .proxy = try alloc.dupe(u8, proxy),
     };
 }
 
@@ -70,6 +79,7 @@ const FileOverrides = struct {
     endpoint: []const u8 = "",
     model: []const u8 = "",
     api_key: []const u8 = "",
+    proxy: []const u8 = "",
 };
 
 fn loadFile(alloc: Allocator) !FileOverrides {
@@ -85,6 +95,7 @@ fn loadFile(alloc: Allocator) !FileOverrides {
         endpoint: ?[]const u8,
         model: ?[]const u8,
         api_key: ?[]const u8,
+        proxy: ?[]const u8 = null,
     };
     var parsed = std.json.parseFromSlice(Cfg, alloc, raw, .{ .ignore_unknown_fields = true }) catch return error.BadJson;
     defer parsed.deinit();
@@ -94,7 +105,13 @@ fn loadFile(alloc: Allocator) !FileOverrides {
         .endpoint = if (c.endpoint) |v| try alloc.dupe(u8, v) else "",
         .model = if (c.model) |v| try alloc.dupe(u8, v) else "",
         .api_key = if (c.api_key) |v| try alloc.dupe(u8, v) else "",
+        .proxy = if (c.proxy) |v| try alloc.dupe(u8, v) else "",
     };
+}
+
+/// Environment value wins over the file value; empty means "unset".
+fn resolve(over: []const u8, under: []const u8) []const u8 {
+    return if (over.len > 0) over else under;
 }
 
 test "load rejects unknown provider" {
@@ -102,4 +119,29 @@ test "load rejects unknown provider" {
     // (we cannot guarantee env in test, so just assert the function type-checks
     // by checking findPreset behaviour already covered in presets tests).
     _ = load;
+}
+
+test "proxy precedence: env overrides file; malformed carried verbatim" {
+    // resolve(over, under): env (over) wins when non-empty; file (under) otherwise.
+    try std.testing.expectEqualStrings("env", resolve("env", "file"));
+    try std.testing.expectEqualStrings("file", resolve("", "file"));
+    // A malformed proxy is carried verbatim; the transport rejects it at startup.
+    try std.testing.expectEqualStrings("not-a-url", resolve("not-a-url", ""));
+}
+
+test "load exposes proxy from config/env without mutating env" {
+    const alloc = std.testing.allocator;
+    const env_proxy = std.process.getEnvVarOwned(alloc, "ZIKI_PROXY") catch null;
+    defer if (env_proxy) |e| alloc.free(e);
+
+    // load MUST succeed (this also guards against config-file parse regressions).
+    const cfg = try load(alloc);
+    defer cfg.deinit(alloc);
+
+    if (env_proxy) |e| {
+        try std.testing.expectEqualStrings(e, cfg.proxy);
+    } else {
+        // No env override: proxy comes from the file (empty in the committed config).
+        try std.testing.expectEqual(@as(usize, 0), cfg.proxy.len);
+    }
 }
