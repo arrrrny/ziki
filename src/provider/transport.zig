@@ -32,6 +32,8 @@ pub const Transport = struct {
 /// Real transport over std.http.Client + std.crypto.tls (no third-party deps).
 /// A fresh client is created per request so connection reuse / keep-alive
 /// quirks of a given proxy can never stall the goal loop on a later turn.
+/// For HTTPS targets with a proxy, we implement manual CONNECT + TLS to work
+/// around std.http 0.15.2's broken proxy+TLS path.
 pub const HttpTransport = struct {
     alloc: Allocator,
     /// Parsed proxy, or null for a direct connection. Built once at init from
@@ -55,8 +57,6 @@ pub const HttpTransport = struct {
 
     fn request(ctx: *anyopaque, alloc: Allocator, method: []const u8, url: []const u8, headers: []const Header, body: []const u8) !HttpResponse {
         const self: *HttpTransport = @ptrCast(@alignCast(ctx));
-        var buf: [8 * 1024 * 1024]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
 
         var req_headers: [16]std.http.Header = undefined;
         var n: usize = 0;
@@ -65,14 +65,56 @@ pub const HttpTransport = struct {
             req_headers[n] = .{ .name = h.name, .value = h.value };
             n += 1;
         }
+        // Default User-Agent so proxies / WAFs (e.g. Cloudflare) don't reject
+        // headerless requests. Skipped if the caller already supplied one.
+        var has_ua = false;
+        for (req_headers[0..n]) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) {
+                has_ua = true;
+                break;
+            }
+        }
+        if (!has_ua and n < req_headers.len) {
+            req_headers[n] = .{ .name = "user-agent", .value = "ziki/0.1" };
+            n += 1;
+        }
         const m: std.http.Method = if (std.mem.eql(u8, method, "GET")) .GET else .POST;
 
+        // Parse URL to determine scheme, host, port, path
+        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+        const is_https = std.mem.eql(u8, uri.scheme, "https");
+        // getHostAlloc may return a slice into `url` (not owned), so dupe it to
+        // get a freeable, owned copy — mirroring makeProxy (line 322).
+        const target_host_raw = try uri.getHostAlloc(alloc);
+        const target_host = try alloc.dupe(u8, target_host_raw);
+        defer alloc.free(target_host);
+        var target_port: u16 = 80;
+        if (uri.port) |p| {
+            target_port = p;
+        } else if (is_https) {
+            target_port = 443;
+        }
+        // Extract path from URL manually (avoid Uri.Component type issues)
+        const scheme_len = if (is_https) "https://".len else "http://".len;
+        const url_after_scheme = url[scheme_len..];
+        const host_end = std.mem.indexOfScalar(u8, url_after_scheme, '/') orelse url_after_scheme.len;
+        const target_path: []const u8 = if (host_end < url_after_scheme.len) url_after_scheme[host_end..] else "/";
+
+        // If we have a proxy AND the target is HTTPS, use manual CONNECT + TLS
+        // to avoid std.http's broken proxy+TLS path (0.15.2).
+        if (self.proxy != null) {
+            if (is_https) {
+                return try requestViaConnectTls(self, alloc, m, target_host, target_port, target_path, req_headers[0..n], body);
+            }
+        }
+
+        // Otherwise (HTTP target, or no proxy): use std.http.Client normally
         var client = std.http.Client{ .allocator = alloc };
         defer client.deinit();
-        // Route through the configured proxy when set. We deliberately do NOT
-        // call client.initDefaultProxies, so system-wide proxy env vars
-        // (http_proxy / https_proxy / all_proxy) are ignored unless the user
-        // explicitly configured one (FR-005).
+        const buf = try alloc.alloc(u8, 8 * 1024 * 1024);
+        defer alloc.free(buf);
+        var w = std.Io.Writer.fixed(buf);
+
         if (self.proxy) |p| {
             client.http_proxy = p;
             client.https_proxy = p;
@@ -90,6 +132,209 @@ pub const HttpTransport = struct {
         return .{ .status = @intFromEnum(result.status), .body = owned };
     }
 };
+
+/// Manual CONNECT + TLS implementation for HTTPS targets through an HTTP proxy.
+/// This bypasses std.http's broken proxy+TLS in 0.15.2.
+fn requestViaConnectTls(
+    self: *HttpTransport,
+    alloc: Allocator,
+    method: std.http.Method,
+    target_host: []const u8,
+    target_port: u16,
+    target_path: []const u8,
+    headers: []const std.http.Header,
+    body: []const u8,
+) !HttpResponse {
+    const proxy = self.proxy.?;
+
+    // 1. Connect to the proxy (TCP)
+    var stream = try std.net.tcpConnectToHost(alloc, proxy.host, proxy.port);
+    defer stream.close();
+
+    // 2. Send CONNECT request
+    var connect_buf: [2048]u8 = undefined;
+    var connect_w = std.Io.Writer.fixed(&connect_buf);
+    var port_buf: [6]u8 = undefined;
+    try connect_w.writeAll("CONNECT ");
+    try connect_w.writeAll(target_host);
+    try connect_w.writeAll(":");
+    try connect_w.writeAll(try std.fmt.bufPrint(&port_buf, "{d}", .{target_port}));
+    try connect_w.writeAll(" HTTP/1.1\r\n");
+    try connect_w.writeAll("Host: ");
+    try connect_w.writeAll(target_host);
+    try connect_w.writeAll(":");
+    try connect_w.writeAll(try std.fmt.bufPrint(&port_buf, "{d}", .{target_port}));
+    try connect_w.writeAll("\r\n");
+    try connect_w.writeAll("User-Agent: ziki/0.1\r\n");
+    try connect_w.writeAll("\r\n");
+
+    const connect_req = connect_w.buffered();
+    _ = try stream.writeAll(connect_req);
+
+    // 3. Read CONNECT response
+    var connect_resp_buf: [4096]u8 = undefined;
+    var connect_r = std.net.Stream.Reader.init(stream, &connect_resp_buf);
+    const cir = connect_r.interface();
+
+    // Read status line
+    const status_line = (try cir.takeDelimiter('\n')) orelse return error.ProxyConnectFailed;
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 200") and !std.mem.startsWith(u8, status_line, "HTTP/1.0 200")) {
+        // Discard rest of response for debugging
+        _ = cir.discardRemaining() catch {};
+        return error.ProxyConnectFailed;
+    }
+
+    // Read headers until empty line
+    while (true) {
+        const line = (try cir.takeDelimiter('\n')) orelse break;
+        if (line.len <= 2) break; // empty line (CRLF or LF)
+    }
+
+    // 4. Wrap the stream with TLS
+    // TLS requires buffers of at least min_buffer_len. The stream reader/writer
+    // need their OWN ciphertext buffers; the Client's read_buffer/write_buffer
+    // are the decrypted/plaintext side and must NOT alias the stream buffers,
+    // or the two layers clobber each other and the response read hangs
+    // (see Client.zig: reader.buffer = options.read_buffer, input = stream reader).
+    var tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var tls_app_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+    var tls_app_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+
+    var tls_input = std.net.Stream.Reader.init(stream, &tls_read_buf);
+    var tls_output = std.net.Stream.Writer.init(stream, &tls_write_buf);
+
+    var tls_client = try std.crypto.tls.Client.init(
+        tls_input.interface(),
+        &tls_output.interface,
+        .{
+            .host = .{ .explicit = target_host },
+            .ca = .no_verification, // TODO: proper cert verification
+            .write_buffer = &tls_app_write_buf,
+            .read_buffer = &tls_app_read_buf,
+        },
+    );
+
+    // 5. Send actual HTTP request over TLS
+    const req_mem = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(req_mem);
+    var req_w = std.Io.Writer.fixed(req_mem);
+    var num_buf: [20]u8 = undefined;
+
+    // Request line
+    const method_str = if (method == .GET) "GET" else "POST";
+    try req_w.writeAll(method_str);
+    try req_w.writeAll(" ");
+    try req_w.writeAll(target_path);
+    try req_w.writeAll(" HTTP/1.1\r\n");
+
+    // Headers
+    try req_w.writeAll("Host: ");
+    try req_w.writeAll(target_host);
+    try req_w.writeAll(":");
+    try req_w.writeAll(try std.fmt.bufPrint(&num_buf, "{d}", .{target_port}));
+    try req_w.writeAll("\r\n");
+    try req_w.writeAll("User-Agent: ziki/0.1\r\n");
+    try req_w.writeAll("Connection: close\r\n");
+    for (headers) |h| {
+        try req_w.writeAll(h.name);
+        try req_w.writeAll(": ");
+        try req_w.writeAll(h.value);
+        try req_w.writeAll("\r\n");
+    }
+    if (body.len > 0) {
+        try req_w.writeAll("Content-Length: ");
+        try req_w.writeAll(try std.fmt.bufPrint(&num_buf, "{d}", .{body.len}));
+        try req_w.writeAll("\r\n");
+    }
+    try req_w.writeAll("\r\n");
+    if (body.len > 0) {
+        try req_w.writeAll(body);
+    }
+
+    const req_data = req_w.buffered();
+    _ = try tls_client.writer.writeAll(req_data);
+    // The TLS Client buffers app data in its own (large) buffer and only drains
+    // when full, and its `drain` only advances the underlying stream writer's
+    // buffer (it never flushes to the socket). For small requests neither
+    // happens automatically, so flush explicitly: encrypt the buffered plaintext
+    // into the stream writer, then push the ciphertext onto the wire.
+    try tls_client.writer.flush();
+    try tls_output.interface.flush();
+
+    // 6. Read HTTP response from TLS
+    const resp_mem = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(resp_mem);
+    var resp_w = std.Io.Writer.fixed(resp_mem);
+    // Point at the Client's reader FIELD (not a copy): tls.Client's reader
+    // vtable recovers the Client via @fieldParentPtr, which only works on the
+    // real field, not a copied interface struct.
+    var resp_r = &tls_client.reader;
+
+    // Read status line
+    const resp_status_line = (try resp_r.takeDelimiter('\n')) orelse "";
+    const status_code = try parseStatusCode(resp_status_line);
+
+    // Read headers
+    var content_length: usize = 0;
+    var chunked = false;
+    while (true) {
+        const line = (try resp_r.takeDelimiter('\n')) orelse break;
+        if (line.len <= 2) break;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const val = std.mem.trim(u8, line["content-length:".len..], "\r\n ");
+            content_length = std.fmt.parseInt(usize, val, 10) catch 0;
+        } else if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
+            if (std.ascii.indexOfIgnoreCase(line, "chunked") != null) {
+                chunked = true;
+            }
+        }
+    }
+
+    // Read body
+    if (chunked) {
+        while (true) {
+            const chunk_size_line = (try resp_r.takeDelimiter('\n')) orelse break;
+            const chunk_size = std.fmt.parseInt(usize, std.mem.trim(u8, chunk_size_line, "\r\n "), 16) catch 0;
+            if (chunk_size == 0) {
+                // Trailing CRLF / trailers
+                _ = resp_r.takeDelimiter('\n') catch null;
+                break;
+            }
+            const chunk = try alloc.alloc(u8, chunk_size);
+            try resp_r.readSliceAll(chunk);
+            try resp_w.writeAll(chunk);
+            alloc.free(chunk);
+            // Consume trailing CRLF after chunk
+            _ = resp_r.takeDelimiter('\n') catch null;
+        }
+    } else if (content_length > 0) {
+        const body_buf = try alloc.alloc(u8, content_length);
+        try resp_r.readSliceAll(body_buf);
+        try resp_w.writeAll(body_buf);
+        alloc.free(body_buf);
+    } else {
+        // Read until EOF
+        var tmp: [8192]u8 = undefined;
+        while (true) {
+            const n = resp_r.readSliceShort(&tmp) catch break;
+            if (n == 0) break;
+            try resp_w.writeAll(tmp[0..n]);
+        }
+    }
+
+    const written = resp_w.buffered();
+    const owned = try alloc.dupe(u8, written);
+    return .{ .status = status_code, .body = owned };
+}
+
+fn parseStatusCode(line: []const u8) !u16 {
+    // HTTP/1.1 200 OK
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    _ = parts.next(); // HTTP/1.1
+    const code_str = parts.next() orelse return error.InvalidHttpResponse;
+    return std.fmt.parseInt(u16, code_str, 10) catch return error.InvalidHttpResponse;
+}
 
 /// Build a std.http.Client.Proxy from a proxy URL. Returns an error on a
 /// malformed URL so the caller can fail fast at startup (FR-007).
