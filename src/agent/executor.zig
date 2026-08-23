@@ -17,6 +17,15 @@ pub const GoalExecutor = struct {
     fs: Fs,
     dir: []const u8,
     session_id: []const u8,
+    verbose: bool = false,
+
+    /// Print a diagnostic line to stdout (only when verbose). Used so an
+    /// autonomous run is observable instead of appearing to "do nothing".
+    fn logLine(alloc: Allocator, comptime fmt: []const u8, args: anytype) void {
+        const s = std.fmt.allocPrint(alloc, fmt ++ "\n", args) catch return;
+        defer alloc.free(s);
+        std.fs.File.stdout().writeAll(s) catch {};
+    }
 
     fn stopPath(self: *GoalExecutor, a: Allocator) ![]u8 {
         return std.fmt.allocPrint(a, "{s}/stop.{s}", .{ self.dir, self.session_id });
@@ -71,6 +80,7 @@ pub const GoalExecutor = struct {
         try messages.append(a, .{ .role = .user, .content = try a.dupe(u8, try std.fmt.allocPrint(a, "Criterion: {s}\nIs it satisfied? Reply with exactly YES or NO.", .{criterion})) });
         const resp = try self.completeRetry(a, .{ .messages = messages.items, .tools = &[0]provider.ToolSpec{} });
         const content = resp.message.content;
+        if (self.verbose) logLine(self.alloc, "verbose: verify -> {s}", .{content});
         try messages.append(a, .{ .role = .assistant, .content = try a.dupe(u8, content) });
         const upper = try std.ascii.allocUpperString(a, content);
         const yes = std.mem.indexOf(u8, upper, "YES") != null;
@@ -125,13 +135,24 @@ pub const GoalExecutor = struct {
             }
             goal.used.turns += 1;
 
+            if (self.verbose) logLine(self.alloc, "verbose: turn {d}: requesting model ({d} msgs)", .{ goal.used.turns, messages.items.len });
+
             const specs = try self.toolSpecs(a);
             const resp = try self.completeRetry(a, .{ .messages = messages.items, .tools = specs });
             try messages.append(a, resp.message);
 
+            if (self.verbose) {
+                if (resp.message.tool_calls) |tcs| {
+                    for (tcs) |tc| logLine(self.alloc, "verbose: tool_call {s} {s}", .{ tc.name, tc.arguments_json });
+                } else {
+                    logLine(self.alloc, "verbose: model: {s}", .{resp.message.content});
+                }
+            }
+
             if (resp.message.tool_calls) |tcs| {
                 for (tcs) |tc| {
                     const res = try self.dispatch(a, tc);
+                    if (self.verbose) logLine(self.alloc, "verbose: tool_result[{s}]: {s}", .{ tc.name, res.output });
                     try messages.append(a, .{
                         .role = .tool,
                         .content = try a.dupe(u8, res.output),
