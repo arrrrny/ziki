@@ -141,7 +141,27 @@ test "load exposes proxy from config/env without mutating env" {
     if (env_proxy) |e| {
         try std.testing.expectEqualStrings(e, cfg.proxy);
     } else {
-        // No env override: proxy comes from the file (empty in the committed config).
-        try std.testing.expectEqual(@as(usize, 0), cfg.proxy.len);
+        // No env override: proxy must come from the file. Read the file's proxy
+        // independently so the test stays deterministic regardless of whether the
+        // local ~/.config/ziki/config.json sets a proxy (FR-005, spec 009).
+        const file_proxy = readConfigProxy(alloc) catch "";
+        defer if (file_proxy.len > 0) alloc.free(file_proxy);
+        try std.testing.expectEqualStrings(file_proxy, cfg.proxy);
     }
+}
+
+/// Test helper: read only the `proxy` field from the resolved config file.
+/// Returns an empty slice when the file or field is absent.
+fn readConfigProxy(alloc: Allocator) ![]const u8 {
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return error.NoHome;
+    defer alloc.free(home);
+    const path = try std.fmt.allocPrint(alloc, "{s}/.config/ziki/config.json", .{home});
+    defer alloc.free(path);
+    const raw = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch return alloc.dupe(u8, "");
+    defer alloc.free(raw);
+    const Cfg = struct { proxy: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(Cfg, alloc, raw, .{ .ignore_unknown_fields = true }) catch return alloc.dupe(u8, "");
+    defer parsed.deinit();
+    if (parsed.value.proxy) |p| return alloc.dupe(u8, p);
+    return alloc.dupe(u8, "");
 }

@@ -84,6 +84,10 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     var criterion: ?[]const u8 = null;
     var provider_override: ?[]const u8 = null;
     var verbose = false;
+    var allow_push = false;
+    var timeout_seconds: u64 = 600;
+    var no_timeout_flag = false;
+    var clean_tree = true;
 
     var i: usize = 1;
     while (i < tokens.len) : (i += 1) {
@@ -108,6 +112,27 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
             provider_override = t["--provider=".len..];
         } else if (std.mem.eql(u8, t, "--verbose") or std.mem.eql(u8, t, "-v")) {
             verbose = true;
+        } else if (std.mem.eql(u8, t, "--allow-push")) {
+            allow_push = true;
+        } else if (std.mem.eql(u8, t, "--timeout")) {
+            if (i + 1 >= tokens.len) {
+                try emitErr("missing value for --timeout");
+                return;
+            }
+            timeout_seconds = std.fmt.parseUnsigned(u64, tokens[i + 1], 10) catch {
+                try emitErr("invalid --timeout value");
+                return;
+            };
+            i += 1;
+        } else if (std.mem.startsWith(u8, t, "--timeout=")) {
+            timeout_seconds = std.fmt.parseUnsigned(u64, t["--timeout=".len..], 10) catch {
+                try emitErr("invalid --timeout value");
+                return;
+            };
+        } else if (std.mem.eql(u8, t, "--no-timeout")) {
+            no_timeout_flag = true;
+        } else if (std.mem.eql(u8, t, "--no-clean")) {
+            clean_tree = false;
         } else {
             try objective_parts.append(alloc, t);
         }
@@ -151,7 +176,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     const search_t = sct.toTool();
     var wt = WriteTool.init(fs_iface);
     const write_t = wt.toTool();
-    var bt = BashTool.init(fs_iface);
+    var bt = BashTool.init(fs_iface, allow_push, if (no_timeout_flag) BashTool.no_timeout else timeout_seconds);
     const bash_t = bt.toTool();
     const tools = [_]Tool{ read_t, edit_t, search_t, write_t, bash_t };
 
@@ -167,6 +192,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         .dir = state_dir,
         .session_id = SESSION_ID,
         .verbose = verbose,
+        .clean_tree = clean_tree,
     };
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
@@ -175,6 +201,20 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     try ex.run(&goal);
     try emitStatus(goal.status);
     try emitSummary(&goal);
+
+    // FR-006: report what changed, what was skipped, and whether a push happened.
+    if (ex.report) |r| {
+        try emit("job report:", .{});
+        try emit("{s}", .{r});
+        alloc.free(r);
+    }
+    const push_line = if (bt.push_occurred)
+        "push: occurred"
+    else if (bt.push_blocked)
+        "push: blocked (not authorized — re-run with --allow-push)"
+    else
+        "push: not requested";
+    try emit("  {s}", .{push_line});
 }
 
 fn runStop(alloc: Allocator, state_dir: []const u8) !void {
@@ -282,7 +322,7 @@ fn goalsHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
 }
 fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
     try emit("commands:", .{});
-    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose]", .{});
+    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
     try emit("  /stop", .{});
     try emit("  /status", .{});
     try emit("  /goals", .{});
@@ -318,7 +358,7 @@ fn runRepl(alloc: Allocator, dispatcher: *Dispatcher) !void {
 
 fn usage() !void {
     try emit("usage:", .{});
-    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose]", .{});
+    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
     try emit("  ziki /status", .{});
     try emit("  ziki /stop", .{});
     try emit("  ziki /goals", .{});
