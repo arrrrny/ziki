@@ -13,6 +13,9 @@ pub const Fs = struct {
         exists: *const fn (ctx: *anyopaque, path: []const u8) bool,
         remove: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
         cwd: *const fn (ctx: *anyopaque) []const u8,
+        /// Direct entry names of a directory (no recursion, no file/dir
+        /// distinction implied). Errors when the directory cannot be opened.
+        read_dir: *const fn (ctx: *anyopaque, alloc: Allocator, path: []const u8) anyerror![][]const u8,
     };
 
     pub fn readFile(self: Fs, alloc: Allocator, path: []const u8) ![]u8 {
@@ -29,6 +32,11 @@ pub const Fs = struct {
     }
     pub fn cwd(self: Fs) []const u8 {
         return self.vtable.cwd(self.ctx);
+    }
+    /// Returns the names of the direct entries of `path`, allocated via
+    /// `alloc` (caller frees the slice and each name).
+    pub fn readDir(self: Fs, alloc: Allocator, path: []const u8) ![][]const u8 {
+        return self.vtable.read_dir(self.ctx, alloc, path);
     }
 };
 
@@ -48,6 +56,7 @@ pub const RealFs = struct {
         .exists = exists,
         .remove = remove,
         .cwd = cwd,
+        .read_dir = readDir,
     };
 
     fn resolve(self: *RealFs, alloc: Allocator, path: []const u8) ![]u8 {
@@ -92,6 +101,23 @@ pub const RealFs = struct {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         return self.cwd_path;
     }
+    fn readDir(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![][]const u8 {
+        const self: *RealFs = @ptrCast(@alignCast(ctx));
+        const abs = try self.resolve(alloc, path);
+        defer alloc.free(abs);
+        var dir = try std.fs.cwd().openDir(abs, .{ .iterate = true });
+        defer dir.close();
+        var names = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+        errdefer {
+            for (names.items) |n| alloc.free(n);
+            names.deinit(alloc);
+        }
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            try names.append(alloc, try alloc.dupe(u8, entry.name));
+        }
+        return names.toOwnedSlice(alloc);
+    }
 };
 
 /// In-memory filesystem for tests.
@@ -112,6 +138,7 @@ pub const FakeFs = struct {
         .exists = exists,
         .remove = remove,
         .cwd = cwd,
+        .read_dir = readDirVt,
     };
 
     pub fn readFile(self: *FakeFs, alloc: Allocator, path: []const u8) ![]u8 {
@@ -165,7 +192,45 @@ pub const FakeFs = struct {
         const self: *FakeFs = @ptrCast(@alignCast(ctx));
         return self.cwd_path;
     }
+
+    /// Synthesizes the direct children of `path` from the flat file map: every
+    /// stored key of the form `<path>/<segment>...` contributes `<segment>`.
+    /// Sorted alphabetically for determinism. Missing directories yield an
+    /// empty slice (FakeFs has no real directory structure to error on).
+    pub fn readDir(self: *FakeFs, alloc: Allocator, path: []const u8) ![][]const u8 {
+        var names = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+        errdefer {
+            for (names.items) |n| alloc.free(n);
+            names.deinit(alloc);
+        }
+        var seen = std.StringHashMap(void).init(alloc);
+        defer seen.deinit();
+        var it = self.files.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, path)) continue;
+            if (key.len == path.len) continue;
+            if (key[path.len] != '/') continue;
+            var rest = key[path.len + 1 ..];
+            const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+            const child = rest[0..end];
+            if (child.len == 0) continue;
+            if (seen.contains(child)) continue;
+            try seen.put(child, {});
+            try names.append(alloc, try alloc.dupe(u8, child));
+        }
+        std.mem.sort([]const u8, names.items, {}, strLessThan);
+        return names.toOwnedSlice(alloc);
+    }
+    fn readDirVt(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![][]const u8 {
+        const self: *FakeFs = @ptrCast(@alignCast(ctx));
+        return self.readDir(alloc, path);
+    }
 };
+
+fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
 
 test "RealFs round-trip via temp" {
     const tmp = std.testing.tmpDir(.{});
@@ -188,4 +253,52 @@ test "FakeFs round-trip" {
     try std.testing.expectEqualStrings("data", got);
     try fs.remove("a.txt");
     try std.testing.expect(!fs.exists("a.txt"));
+}
+
+test "RealFs readDir lists direct entries" {
+    const alloc = std.testing.allocator;
+    const tmp = std.testing.tmpDir(.{ .iterate = true });
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "x" });
+    try tmp.dir.makePath("sub");
+    try tmp.dir.writeFile(.{ .sub_path = "sub/b.txt", .data = "y" });
+    const abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(abs);
+    var impl = RealFs.init(abs);
+    const fs = impl.toFs();
+    const names = try fs.readDir(alloc, ".");
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    // Direct entries only: a.txt and sub (not sub/b.txt), sorted.
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("a.txt", names[0]);
+    try std.testing.expectEqualStrings("sub", names[1]);
+    // A missing directory errors (RealFs semantics).
+    try std.testing.expectError(error.FileNotFound, fs.readDir(alloc, "nope"));
+}
+
+test "FakeFs readDir synthesizes direct children" {
+    var fake = FakeFs.init(std.testing.allocator, "/wd");
+    defer fake.deinit();
+    try fake.writeFile(std.testing.allocator, ".ziki/skills/foo/SKILL.md", "x");
+    try fake.writeFile(std.testing.allocator, ".ziki/skills/bar/SKILL.md", "y");
+    try fake.writeFile(std.testing.allocator, ".ziki/skills/bar/extra.md", "z");
+    try fake.writeFile(std.testing.allocator, "other.txt", "w");
+    const fs = fake.toFs();
+    const names = try fs.readDir(std.testing.allocator, ".ziki/skills");
+    defer {
+        for (names) |n| std.testing.allocator.free(n);
+        std.testing.allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("bar", names[0]);
+    try std.testing.expectEqualStrings("foo", names[1]);
+    // Missing directory: empty, not an error (documented FakeFs semantics).
+    const none = try fs.readDir(std.testing.allocator, "absent");
+    defer {
+        for (none) |n| std.testing.allocator.free(n);
+        std.testing.allocator.free(none);
+    }
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }

@@ -16,6 +16,9 @@ const EditTool = @import("tool/edit.zig").EditTool;
 const SearchTool = @import("tool/search.zig").SearchTool;
 const WriteTool = @import("tool/write.zig").WriteTool;
 const BashTool = @import("tool/bash.zig").BashTool;
+const skill_registry = @import("skill/registry.zig");
+const SkillTool = @import("skill/tool.zig").SkillTool;
+const skill_cmds = @import("skill/handler.zig");
 
 const Intent = @import("shell/intent.zig").Intent;
 const Result = @import("shell/intent.zig").Result;
@@ -74,7 +77,7 @@ fn writeSessionProvider(alloc: Allocator, state_dir: []const u8, name: []const u
 // so the dispatcher stays command-agnostic (SC-005, DIP).
 // ---------------------------------------------------------------------------
 
-fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs) !void {
+fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs, registry: *const skill_registry.SkillRegistry) !void {
     if (tokens.len < 2) {
         try emitErr("goal objective must not be empty");
         return;
@@ -150,7 +153,22 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     const write_t = wt.toTool();
     var bt = BashTool.init(fs_iface);
     const bash_t = bt.toTool();
-    const tools = [_]Tool{ read_t, edit_t, search_t, write_t, bash_t };
+
+    // Skills (FR-005, FR-006, FR-010): the skill tool and the system-prompt
+    // section exist only when at least one skill was discovered — with zero
+    // skills the goal path behaves exactly as before this feature.
+    var st = SkillTool.init(registry);
+    const skill_t = st.toTool();
+    var tools_storage: [6]Tool = .{ read_t, edit_t, search_t, write_t, bash_t, undefined };
+    var tools_len: usize = 5;
+    var skills_listing: ?[]const u8 = null;
+    defer if (skills_listing) |sl| alloc.free(sl);
+    if (registry.list().len > 0) {
+        tools_storage[5] = skill_t;
+        tools_len = 6;
+        skills_listing = skill_registry.listingText(alloc, registry) catch null;
+    }
+    const tools = tools_storage[0..tools_len];
 
     var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
     const repo = repo_impl.toRepository();
@@ -158,12 +176,13 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     var ex = GoalExecutor{
         .alloc = alloc,
         .provider = prov,
-        .tools = &tools,
+        .tools = tools,
         .repo = repo,
         .fs = fs_iface,
         .dir = state_dir,
         .session_id = SESSION_ID,
         .verbose = verbose,
+        .skills_listing = skills_listing,
     };
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
@@ -232,11 +251,12 @@ fn runProvider(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8) !v
 
 // --- Handler context structs + vtable bindings ---
 
-const GoalCtx = struct { state_dir: []const u8, fs: Fs };
+const GoalCtx = struct { state_dir: []const u8, fs: Fs, registry: *const skill_registry.SkillRegistry };
 const StopCtx = struct { state_dir: []const u8 };
 const ProviderCtx = struct { state_dir: []const u8 };
 const StatusCtx = struct { state_dir: []const u8, fs: Fs };
 const GoalsCtx = struct { state_dir: []const u8, fs: Fs };
+const SkillCtx = struct { registry: *const skill_registry.SkillRegistry };
 const HelpCtx = struct {};
 
 fn goalHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
@@ -246,7 +266,7 @@ fn goalHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     try toks.append(alloc, "/goal");
     var it = std.mem.tokenizeScalar(u8, intent.args, ' ');
     while (it.next()) |t| try toks.append(alloc, t);
-    runGoal(alloc, toks.items, self.state_dir, self.fs) catch {};
+    runGoal(alloc, toks.items, self.state_dir, self.fs, self.registry) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
 fn stopHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
@@ -277,6 +297,18 @@ fn goalsHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     runGoals(alloc, self.state_dir, self.fs) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
+fn skillHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *SkillCtx = @ptrCast(@alignCast(ctx_));
+    const out = skill_cmds.runSkillCommand(alloc, self.registry, intent.args) catch |e| {
+        const msg = try std.fmt.allocPrint(alloc, "error: {s}", .{@errorName(e)});
+        defer alloc.free(msg);
+        try emit("{s}", .{msg});
+        return Result{ .output = try alloc.dupe(u8, "") };
+    };
+    defer alloc.free(out);
+    try emit("{s}", .{out});
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
 fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
     try emit("commands:", .{});
     try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose]", .{});
@@ -284,6 +316,7 @@ fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
     try emit("  /status", .{});
     try emit("  /goals", .{});
     try emit("  /provider [name]", .{});
+    try emit("  /skill [list|show <name>]", .{});
     try emit("  /help", .{});
     return Result{ .output = try std.heap.page_allocator.dupe(u8, "") };
 }
@@ -293,6 +326,7 @@ const stop_vtable = Handler.VTable{ .handle = stopHandle };
 const provider_vtable = Handler.VTable{ .handle = providerHandle };
 const status_vtable = Handler.VTable{ .handle = statusHandle };
 const goals_vtable = Handler.VTable{ .handle = goalsHandle };
+const skill_vtable = Handler.VTable{ .handle = skillHandle };
 const help_vtable = Handler.VTable{ .handle = helpHandle };
 
 // --- REPL output sink: stdout ---
@@ -320,6 +354,7 @@ fn usage() !void {
     try emit("  ziki /stop", .{});
     try emit("  ziki /goals", .{});
     try emit("  ziki /provider [name]", .{});
+    try emit("  ziki /skill [list|show <name>]", .{});
     try emit("  ziki            (interactive REPL)", .{});
 }
 
@@ -340,12 +375,23 @@ pub fn main() !void {
     var realfs_impl = RealFs.init(cwd);
     const fs_iface = realfs_impl.toFs();
 
+    // Skills (FR-002): discover once per invocation; the registry is shared
+    // by /goal (system-prompt listing + skill tool) and /skill (list/show).
+    const skill_roots = skill_registry.defaultRoots(alloc, cwd) catch &[_][]const u8{};
+    defer {
+        for (skill_roots) |r| alloc.free(r);
+        alloc.free(skill_roots);
+    }
+    var skill_reg = skill_registry.SkillRegistry.load(alloc, fs_iface, skill_roots) catch skill_registry.SkillRegistry.init(alloc);
+    defer skill_reg.deinit();
+
     // Composition root: build the dispatcher and inject the handlers.
-    var gh = GoalCtx{ .state_dir = state_dir, .fs = fs_iface };
+    var gh = GoalCtx{ .state_dir = state_dir, .fs = fs_iface, .registry = &skill_reg };
     var sh = StopCtx{ .state_dir = state_dir };
     var ph = ProviderCtx{ .state_dir = state_dir };
     var st = StatusCtx{ .state_dir = state_dir, .fs = fs_iface };
     var gl = GoalsCtx{ .state_dir = state_dir, .fs = fs_iface };
+    var sk = SkillCtx{ .registry = &skill_reg };
     var hp = HelpCtx{};
 
     var dispatcher = Dispatcher.init(alloc);
@@ -355,6 +401,7 @@ pub fn main() !void {
     try dispatcher.register("provider", .{ .ctx = &ph, .vtable = &provider_vtable });
     try dispatcher.register("status", .{ .ctx = &st, .vtable = &status_vtable });
     try dispatcher.register("goals", .{ .ctx = &gl, .vtable = &goals_vtable });
+    try dispatcher.register("skill", .{ .ctx = &sk, .vtable = &skill_vtable });
     try dispatcher.register("help", .{ .ctx = &hp, .vtable = &help_vtable });
 
     if (args.len < 2) {
