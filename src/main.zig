@@ -83,6 +83,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     defer objective_parts.deinit(alloc);
     var criterion: ?[]const u8 = null;
     var provider_override: ?[]const u8 = null;
+    var verbose = false;
 
     var i: usize = 1;
     while (i < tokens.len) : (i += 1) {
@@ -105,6 +106,8 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
             i += 1;
         } else if (std.mem.startsWith(u8, t, "--provider=")) {
             provider_override = t["--provider=".len..];
+        } else if (std.mem.eql(u8, t, "--verbose") or std.mem.eql(u8, t, "-v")) {
+            verbose = true;
         } else {
             try objective_parts.append(alloc, t);
         }
@@ -160,6 +163,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         .fs = fs_iface,
         .dir = state_dir,
         .session_id = SESSION_ID,
+        .verbose = verbose,
     };
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
@@ -275,7 +279,7 @@ fn goalsHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
 }
 fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
     try emit("commands:", .{});
-    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>]", .{});
+    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose]", .{});
     try emit("  /stop", .{});
     try emit("  /status", .{});
     try emit("  /goals", .{});
@@ -311,7 +315,7 @@ fn runRepl(alloc: Allocator, dispatcher: *Dispatcher) !void {
 
 fn usage() !void {
     try emit("usage:", .{});
-    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>]", .{});
+    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose]", .{});
     try emit("  ziki /status", .{});
     try emit("  ziki /stop", .{});
     try emit("  ziki /goals", .{});
