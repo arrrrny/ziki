@@ -1,6 +1,41 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Expand a leading home-directory shorthand to the user's `$HOME`.
+///
+/// - `"~/foo"` / `"~/"`  -> `"$HOME/foo"`
+/// - `"~"` (bare)       -> `"$HOME"`
+/// - anything else      -> returned unchanged (caller-owned copy)
+///
+/// The Zig stdlib has no `expandTilde`; we read `HOME` via
+/// `std.process.getEnvVarOwned`. When `HOME` is unset or the path does not
+/// start with `~`, the original path is returned (FR-001).
+pub fn expandTilde(alloc: Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0 or path[0] != '~') return alloc.dupe(u8, path);
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return alloc.dupe(u8, path);
+    if (path.len == 1) {
+        // bare "~" -> $HOME (fresh copy; `home` is freed, never returned).
+        const dup = try alloc.dupe(u8, home);
+        alloc.free(home);
+        return dup;
+    }
+    if (path[1] == '/') {
+        if (path.len == 2) {
+            // "~/" alone means the home directory.
+            const dup = try alloc.dupe(u8, home);
+            alloc.free(home);
+            return dup;
+        }
+        const joined = try std.fs.path.join(alloc, &.{ home, path[2..] });
+        alloc.free(home);
+        return joined;
+    }
+    // "~otheruser" is unsupported; leave unchanged (return a copy).
+    const dup = try alloc.dupe(u8, path);
+    alloc.free(home);
+    return dup;
+}
+
 /// Filesystem boundary (DI). Tools and the goal repository depend on this
 /// interface, never on std.fs directly, so they are testable with FakeFs.
 pub const Fs = struct {
@@ -60,8 +95,12 @@ pub const RealFs = struct {
     };
 
     fn resolve(self: *RealFs, alloc: Allocator, path: []const u8) ![]u8 {
-        if (std.fs.path.isAbsolute(path)) return alloc.dupe(u8, path);
-        return std.fs.path.join(alloc, &.{ self.cwd_path, path });
+        // FR-001: expand a leading `~` to `$HOME` before resolving, so file
+        // tools accept home-directory shorthand (read/edit/write/search).
+        const expanded = try expandTilde(alloc, path);
+        defer alloc.free(expanded);
+        if (std.fs.path.isAbsolute(expanded)) return alloc.dupe(u8, expanded);
+        return std.fs.path.join(alloc, &.{ self.cwd_path, expanded });
     }
 
     fn readFile(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![]u8 {
@@ -116,6 +155,7 @@ pub const RealFs = struct {
         while (try it.next()) |entry| {
             try names.append(alloc, try alloc.dupe(u8, entry.name));
         }
+        std.mem.sort([]const u8, names.items, {}, strLessThan);
         return names.toOwnedSlice(alloc);
     }
 };
@@ -301,4 +341,39 @@ test "FakeFs readDir synthesizes direct children" {
         std.testing.allocator.free(none);
     }
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "expandTilde resolves ~ to $HOME" {
+    const alloc = std.testing.allocator;
+    // HOME is always set in this environment; derive the expected result from it
+    // so the assertion is deterministic regardless of its concrete value.
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch {
+        // No HOME (e.g. some CI): expansion is a no-op; just confirm that.
+        const same = try expandTilde(alloc, "~/foo");
+        defer alloc.free(same);
+        try std.testing.expectEqualStrings("~/foo", same);
+        return;
+    };
+    defer alloc.free(home);
+
+    // ~/foo -> $HOME/foo (a distinct allocation).
+    const foo = try expandTilde(alloc, "~/foo");
+    defer alloc.free(foo);
+    const want_foo = try std.fs.path.join(alloc, &.{ home, "foo" });
+    defer alloc.free(want_foo);
+    try std.testing.expectEqualStrings(want_foo, foo);
+
+    // "~/ and bare "~" alias $HOME (content equality; fresh allocation, freed below).
+    const slash = try expandTilde(alloc, "~/");
+    defer alloc.free(slash);
+    try std.testing.expectEqualStrings(home, slash);
+
+    const bare = try expandTilde(alloc, "~");
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings(home, bare);
+
+    // Non-tilde paths are returned as a distinct copy (unchanged).
+    const plain = try expandTilde(alloc, "src/main.zig");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("src/main.zig", plain);
 }

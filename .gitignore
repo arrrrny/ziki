@@ -4,3 +4,4 @@ zig-out/
 *.o
 *.a
 .zig-cache/
+.worktrees/

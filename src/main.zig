@@ -7,6 +7,10 @@ const HttpTransport = @import("provider/transport.zig").HttpTransport;
 const RealFs = @import("fs/fs.zig").RealFs;
 const Fs = @import("fs/fs.zig").Fs;
 const GoalExecutor = @import("agent/executor.zig").GoalExecutor;
+const state = @import("agent/state.zig");
+const herdr = @import("agent/herdr.zig");
+const Transport = @import("provider/transport.zig").Transport;
+const FakeTransport = @import("provider/transport.zig").FakeTransport;
 const Goal = @import("goal/goal.zig").Goal;
 const Status = @import("goal/goal.zig").Status;
 const FsGoalRepository = @import("goal/repository.zig").FsGoalRepository;
@@ -77,6 +81,42 @@ fn writeSessionProvider(alloc: Allocator, state_dir: []const u8, name: []const u
 // so the dispatcher stays command-agnostic (SC-005, DIP).
 // ---------------------------------------------------------------------------
 
+/// AnyWriter that emits to stdout (fd 1). Used by the Herdr state publisher to
+/// write the `[ziki-state: ...]` screen marker and OSC title. `std.fs.File`
+/// lacks the new `Writer.any()` helper, so we build the `AnyWriter` directly.
+fn stdoutWriteFn(_: *const anyopaque, bytes: []const u8) anyerror!usize {
+    return std.fs.File.stdout().write(bytes);
+}
+fn stdoutAnyWriter() std.io.AnyWriter {
+    return .{ .context = undefined, .writeFn = stdoutWriteFn };
+}
+
+/// Build the Herdr `StatePublisher` for a goal (spec 011, FR-008).
+///
+/// When `pane_id` is set, resolves the Herdr API URL and builds a real
+/// `HerdrHttpClient` reporter (stored in `herdr_client_slot`, which the caller
+/// owns and keeps alive for the run) so Ziki pushes state to Herdr. When
+/// `pane_id` is null, returns a publisher with `reporter = null`: it still
+/// emits the screen marker + OSC title but never pushes (degraded mode).
+fn buildStatePublisher(
+    alloc: Allocator,
+    transport: Transport,
+    pane_id: ?[]const u8,
+    goal_id: []const u8,
+    state_dir: []const u8,
+    herdr_client_slot: *?herdr.HerdrHttpClient,
+    writer: std.io.AnyWriter,
+) !state.StatePublisher {
+    var reporter: ?state.HerdrReporter = null;
+    if (pane_id) |_| {
+        const api_url = try herdr.resolveApiUrl(alloc);
+        herdr_client_slot.* = herdr.HerdrHttpClient.init(alloc, transport, api_url);
+        reporter = (herdr_client_slot.*).?.toReporter();
+        alloc.free(api_url);
+    }
+    return state.StatePublisher.init(alloc, reporter, writer, pane_id orelse "", goal_id, state_dir);
+}
+
 fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs, registry: *const skill_registry.SkillRegistry) !void {
     if (tokens.len < 2) {
         try emitErr("goal objective must not be empty");
@@ -87,6 +127,10 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     var criterion: ?[]const u8 = null;
     var provider_override: ?[]const u8 = null;
     var verbose = false;
+    var allow_push = false;
+    var timeout_seconds: u64 = 600;
+    var no_timeout_flag = false;
+    var clean_tree = true;
 
     var i: usize = 1;
     while (i < tokens.len) : (i += 1) {
@@ -111,6 +155,27 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
             provider_override = t["--provider=".len..];
         } else if (std.mem.eql(u8, t, "--verbose") or std.mem.eql(u8, t, "-v")) {
             verbose = true;
+        } else if (std.mem.eql(u8, t, "--allow-push")) {
+            allow_push = true;
+        } else if (std.mem.eql(u8, t, "--timeout")) {
+            if (i + 1 >= tokens.len) {
+                try emitErr("missing value for --timeout");
+                return;
+            }
+            timeout_seconds = std.fmt.parseUnsigned(u64, tokens[i + 1], 10) catch {
+                try emitErr("invalid --timeout value");
+                return;
+            };
+            i += 1;
+        } else if (std.mem.startsWith(u8, t, "--timeout=")) {
+            timeout_seconds = std.fmt.parseUnsigned(u64, t["--timeout=".len..], 10) catch {
+                try emitErr("invalid --timeout value");
+                return;
+            };
+        } else if (std.mem.eql(u8, t, "--no-timeout")) {
+            no_timeout_flag = true;
+        } else if (std.mem.eql(u8, t, "--no-clean")) {
+            clean_tree = false;
         } else {
             try objective_parts.append(alloc, t);
         }
@@ -135,7 +200,10 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         return;
     }
 
-    var transport = HttpTransport.init(alloc);
+    var transport = HttpTransport.init(alloc, if (cfg.proxy.len > 0) cfg.proxy else null) catch {
+        try emitErr("invalid proxy URL in configuration");
+        return;
+    };
     defer transport.deinit();
     var prov_impl = presets.build(alloc, effective, cfg.endpoint, cfg.model, cfg.api_key, transport.toTransport()) catch {
         try emitErr("could not build provider");
@@ -151,7 +219,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     const search_t = sct.toTool();
     var wt = WriteTool.init(fs_iface);
     const write_t = wt.toTool();
-    var bt = BashTool.init(fs_iface);
+    var bt = BashTool.init(fs_iface, allow_push, if (no_timeout_flag) BashTool.no_timeout else timeout_seconds);
     const bash_t = bt.toTool();
 
     // Skills (FR-005, FR-006, FR-010): the skill tool and the system-prompt
@@ -183,14 +251,40 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         .session_id = SESSION_ID,
         .verbose = verbose,
         .skills_listing = skills_listing,
+        .clean_tree = clean_tree,
     };
+    // FR-006: the job report is allocated inside the run (finalizeReport). Free it
+    // on every exit path, including when ex.run() throws (the explicit free below
+    // would otherwise be skipped and the buffer would leak).
+    defer if (ex.report) |r| alloc.free(r);
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
     defer goal.deinit(alloc);
+
+    // Spec 011: wire the Herdr state publisher. `buildStatePublisher` reads
+    // HERDR_PANE_ID and builds a real reporter when present, or a null-reporter
+    // publisher (screen markers + OSC only) when absent (FR-008).
+    const stdout_writer = stdoutAnyWriter();
+    var herdr_client_slot: ?herdr.HerdrHttpClient = null;
+    ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), std.posix.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, stdout_writer);
+
     try emitStatus(.active);
     try ex.run(&goal);
     try emitStatus(goal.status);
     try emitSummary(&goal);
+
+    // FR-006: report what changed, what was skipped, and whether a push happened.
+    if (ex.report) |r| {
+        try emit("job report:", .{});
+        try emit("{s}", .{r});
+    }
+    const push_line = if (bt.push_occurred)
+        "push: occurred"
+    else if (bt.push_blocked)
+        "push: blocked (not authorized — re-run with --allow-push)"
+    else
+        "push: not requested";
+    try emit("  {s}", .{push_line});
 }
 
 fn runStop(alloc: Allocator, state_dir: []const u8) !void {
@@ -311,7 +405,7 @@ fn skillHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
 }
 fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
     try emit("commands:", .{});
-    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose]", .{});
+    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
     try emit("  /stop", .{});
     try emit("  /status", .{});
     try emit("  /goals", .{});
@@ -349,7 +443,7 @@ fn runRepl(alloc: Allocator, dispatcher: *Dispatcher) !void {
 
 fn usage() !void {
     try emit("usage:", .{});
-    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose]", .{});
+    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
     try emit("  ziki /status", .{});
     try emit("  ziki /stop", .{});
     try emit("  ziki /goals", .{});
@@ -423,4 +517,30 @@ pub fn main() !void {
     };
     if (result.output.len > 0) try emit("{s}", .{result.output});
     alloc.free(result.output);
+}
+
+test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null otherwise (U19)" {
+    const alloc = std.testing.allocator;
+    var ft = FakeTransport.init(200, "");
+    const t = ft.toTransport();
+
+    var slot: ?herdr.HerdrHttpClient = null;
+    var wbuf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&wbuf);
+    const w = fbs.writer().any();
+    const with = try buildStatePublisher(alloc, t, "pane-9", "goal-9", "/wd", &slot, w);
+    try std.testing.expect(with.reporter != null);
+    try std.testing.expect(slot != null); // client retained for the run's lifetime
+
+    var slot2: ?herdr.HerdrHttpClient = null;
+    var without = try buildStatePublisher(alloc, t, null, "goal-10", "/wd", &slot2, w);
+    try std.testing.expect(without.reporter == null);
+    try std.testing.expect(slot2 == null);
+
+    // The no-reporter publisher is still safe to publish (degraded mode).
+    var buf: [256]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&buf);
+    without.writer = fbs2.writer().any();
+    without.publish(.working, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..fbs2.pos], "[ziki-state: working]") != null);
 }
