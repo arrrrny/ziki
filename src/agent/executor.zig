@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const state = @import("state.zig");
 const provider = @import("../provider/provider.zig");
 const Tool = @import("../tool/tool.zig").Tool;
 const ToolResult = @import("../tool/tool.zig").ToolResult;
@@ -32,6 +33,11 @@ pub const GoalExecutor = struct {
     skipped: std.ArrayList(u8) = undefined,
     /// Final job report string (owned by `alloc`), available after `run`.
     report: ?[]const u8 = null,
+    /// Optional Herdr state publisher (spec 011). When set, the executor emits
+    /// Ziki's agent state at each lifecycle transition (working at start,
+    /// blocked/idle at terminal). When null the loop behaves exactly as before
+    /// (SC-005): no publication, no side effects (FR-008).
+    publisher: ?state.StatePublisher = null,
 
     /// Print a diagnostic line to stdout (only when verbose). Used so an
     /// autonomous run is observable instead of appearing to "do nothing".
@@ -151,10 +157,17 @@ pub const GoalExecutor = struct {
         try messages.append(a, .{ .role = .user, .content = try a.dupe(u8, up) });
 
         var verify_attempts: u32 = 0;
+        // FR-001/FR-002: announce `working` the moment the loop becomes active.
+        if (self.publisher != null) {
+            self.publisher.?.publish(.working, null);
+        }
         while (goal.status == .active) {
             if (self.fs.exists(try self.stopPath(a))) {
                 self.fs.remove(try self.stopPath(a)) catch {};
                 goal.status = .aborted;
+                if (self.publisher != null) {
+            self.publisher.?.publish(.idle, "aborted by user");
+                }
                 try self.setProgress(goal, "aborted by user");
                 try self.addSkip("job aborted by user");
                 try self.repo.save(self.alloc, goal.*);
@@ -162,6 +175,9 @@ pub const GoalExecutor = struct {
             }
             if (goal.used.turns >= goal.budgets.max_turns) {
                 goal.status = .aborted;
+                if (self.publisher != null) {
+            self.publisher.?.publish(.idle, "aborted: turn budget exceeded");
+                }
                 try self.setProgress(goal, "aborted: turn budget exceeded");
                 try self.addSkip("aborted: turn budget exceeded");
                 try self.repo.save(self.alloc, goal.*);
@@ -204,6 +220,9 @@ pub const GoalExecutor = struct {
                 const satisfied = try self.verify(a, &messages, crit);
                 if (satisfied) {
                     goal.status = .completed;
+                    if (self.publisher != null) {
+            self.publisher.?.publish(.idle, null);
+                    }
                     try self.setProgress(goal, "completed: criterion satisfied");
                     try self.repo.save(self.alloc, goal.*);
                     return;
@@ -211,6 +230,9 @@ pub const GoalExecutor = struct {
                 verify_attempts += 1;
                 if (verify_attempts >= 3) {
                     goal.status = .blocked;
+                    if (self.publisher != null) {
+            self.publisher.?.publish(.blocked, "criterion not satisfied after retries");
+                    }
                     try self.setProgress(goal, "could not satisfy criterion after retries");
                     try self.addSkip("completion criterion not satisfied after retries");
                     try self.repo.save(self.alloc, goal.*);
@@ -220,6 +242,9 @@ pub const GoalExecutor = struct {
             }
 
             goal.status = .completed;
+            if (self.publisher != null) {
+            self.publisher.?.publish(.idle, null);
+            }
             try self.setProgress(goal, "completed");
             try self.repo.save(self.alloc, goal.*);
             return;

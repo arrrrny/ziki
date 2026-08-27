@@ -68,7 +68,7 @@ doesn't ship.
 
 ```bash
 zig build
-zig build test      # 33 tests. all green. no exceptions.
+zig build test      # 65 tests. all green. no exceptions.
 ./zig-out/bin/ziki /goal "your objective" --provider cliproxy
 ```
 
@@ -82,6 +82,24 @@ Config lives at `~/.config/ziki/config.json`:
   "api_key": "your-key"
 }
 ```
+
+## HERDR STATE SYNC
+
+When Ziki runs inside a [Herdr](https://github.com/arrrrny/herdr) pane, it publishes
+its live agent state so Forklift and the Herdr sidebar can coordinate panes without
+transcript scraping (spec `011-herdr-ziki-state-sync`, FR-001…FR-008).
+
+Two optional environment variables drive it:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `HERDR_PANE_ID` | unset | When set, Ziki pushes `working`/`blocked`/`idle` to Herdr's agent-state API (`${HERDR_API_URL}/api/v1/pane/report/agent`). When unset, Ziki degrades to **screen-only** mode: it still emits the `[ziki-state: <state>]` marker and the `\x1b]2;ziki:<state>\x07` OSC title to stdout, so Herdr can classify the pane without the push path — no crash either way. |
+| `HERDR_API_URL` | `http://localhost:7878` | Base URL of the Herdr instance to report state to. |
+
+State is pushed authoritatively: the pushed `state` always matches the on-screen
+marker, and `seq` is strictly increasing so a stale report can never win. On a clean
+exit Ziki always pushes a terminal `idle`. (A pane that dies without a terminal report
+is resolved to `unknown` by Herdr's own detection window — a cross-repo concern.)
 
 ## PRINCIPLES (NON-NEGOTIABLE)
 
