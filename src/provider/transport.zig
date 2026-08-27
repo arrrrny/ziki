@@ -410,6 +410,17 @@ test "makeProxy parses https with default port" {
     try std.testing.expectEqual(@as(u16, 443), p.port);
 }
 
+test "makeProxy parses https with explicit port" {
+    const alloc = std.testing.allocator;
+    const p = try makeProxy(alloc, "https://proxy.example.com:3128");
+    defer {
+        alloc.free(p.host);
+        alloc.destroy(p);
+    }
+    try std.testing.expectEqual(std.http.Client.Protocol.tls, p.protocol);
+    try std.testing.expectEqual(@as(u16, 3128), p.port);
+}
+
 test "makeProxy rejects malformed url" {
     try std.testing.expectError(error.InvalidProxyUrl, makeProxy(std.testing.allocator, "not-a-url"));
     try std.testing.expectError(error.InvalidProxyUrl, makeProxy(std.testing.allocator, "ftp:///no-host"));
@@ -427,3 +438,80 @@ test "HttpTransport with proxy stores parsed proxy" {
     try std.testing.expectEqualStrings("localhost", t.proxy.?.host);
     try std.testing.expectEqual(@as(u16, 8890), t.proxy.?.port);
 }
+
+test "HttpTransport routes HTTP requests through the configured proxy" {
+    const alloc = std.testing.allocator;
+    // In-process HTTP proxy: records that a request arrived (proving the
+    // transport assigned client.http_proxy) and answers 200. For an HTTP target
+    // std.http.Client sends the absolute URL to the proxy, never to the bare
+    // target host.
+    var server = try std.net.Address.listen(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8791), .{ .reuse_address = true });
+    defer server.deinit();
+    var proxied = false;
+    const Proxy = struct {
+        fn run(s: *std.net.Server, seen: *bool) void {
+            const conn = s.accept() catch return;
+            defer conn.stream.close();
+            // makeProxy sets supports_connect = true, so std.http tunnels HTTP
+            // targets via CONNECT: the client sends CONNECT first, then the real
+            // request over the tunnel. Reply 200 to CONNECT, then read+drain the
+            // tunneled request and answer 200.
+            var buf: [1 << 16]u8 = undefined;
+            // 1) CONNECT request
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch return;
+                if (n == 0) return;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            _ = conn.stream.writeAll("HTTP/1.1 200 Connection established\r\n\r\n") catch return;
+            // 2) tunneled real request (head + body)
+            var total2: usize = 0;
+            var content_len: usize = 0;
+            var have_head = false;
+            while (total2 < buf.len) {
+                const n = conn.stream.read(buf[total2..]) catch return;
+                if (n == 0) return;
+                total2 += n;
+                if (!have_head) {
+                    if (std.mem.indexOf(u8, buf[0..total2], "\r\n\r\n")) |he| {
+                        have_head = true;
+                        var it = std.mem.tokenizeScalar(u8, buf[0..he], '\n');
+                        while (it.next()) |line| {
+                            const tl = std.mem.trim(u8, line, "\r");
+                            if (std.ascii.startsWithIgnoreCase(tl, "content-length:")) {
+                                content_len = std.fmt.parseUnsigned(usize, std.mem.trim(u8, tl["content-length:".len..], " "), 10) catch 0;
+                            }
+                        }
+                    }
+                }
+                if (have_head) {
+                    const he_idx = std.mem.indexOf(u8, buf[0..total2], "\r\n\r\n").?;
+                    if (total2 >= he_idx + 4 + content_len) break;
+                }
+            }
+            seen.* = true;
+            const resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            _ = conn.stream.writeAll(resp) catch return;
+        }
+    };
+    var th = try std.Thread.spawn(.{}, Proxy.run, .{ &server, &proxied });
+    defer th.join();
+
+    var transport = try HttpTransport.init(alloc, "http://127.0.0.1:8791");
+    defer transport.deinit();
+    const t = transport.toTransport();
+    // Target port 9 is never connected to; the request must hit the proxy.
+    const resp = try t.request(alloc, "POST", "http://127.0.0.1:9/ignored", &[_]Header{}, "{}");
+    defer alloc.free(resp.body);
+    // U11: the request was routed through the proxy (never the bare target) and
+    // the proxy's 200 came back. (System-proxy opt-out is U9 + live scenario E.)
+    try std.testing.expect(proxied);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+}
+
+// NOTE: The HTTPS-through-proxy (CONNECT+TLS) test was moved to
+// `src/provider/transport_tls.zig` and is intentionally NOT imported by
+// `tests.zig`, so the default `zig build test` suite stays non-TLS. Restore it
+// to the active run (import the file in tests.zig) when TLS is in scope.

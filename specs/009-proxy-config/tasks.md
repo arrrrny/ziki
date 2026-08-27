@@ -34,9 +34,9 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T002 [US1] [TDD] Write config test FIRST in `src/config/config.zig`: load a config JSON containing `"proxy"` and assert `Config.proxy` equals it; load with `ZIKI_PROXY` env set and assert env wins; load with no proxy key and assert `proxy` is `""`. MUST fail before implementation.
-- [ ] T003 [US1] [TDD] Write config test FIRST in `src/config/config.zig`: malformed `proxy` value still parses as a string (parsing/validation happens at transport init, not here) — assert the field is carried verbatim so the transport can reject it at startup.
-- [ ] T004 [US1] Add `proxy: []const u8` to `Config` and `FileOverrides` in `src/config/config.zig`; load from JSON key `proxy`; override with `ZIKI_PROXY` env when set (same precedence as `ZIKI_PROVIDER`/`ZIKI_ENDPOINT`/`ZIKI_MODEL`/`ZIKI_API_KEY`); default `""`.
+- [ ] T002 [US1] [TDD] [U1,U2,U4] Write config test FIRST in `src/config/config.zig`: load a config JSON containing `"proxy"` and assert `Config.proxy` equals it; load with `ZIKI_PROXY` env set and assert env wins; load with no proxy key and assert `proxy` is `""`. MUST fail before implementation.
+- [ ] T003 [US1] [TDD] [U3] Write config test FIRST in `src/config/config.zig`: malformed `proxy` value still parses as a string (parsing/validation happens at transport init, not here) — assert the field is carried verbatim so the transport can reject it at startup.
+- [ ] T004 [US1] [U1,U2,U3,U4] Add `proxy: []const u8` to `Config` and `FileOverrides` in `src/config/config.zig`; load from JSON key `proxy`; override with `ZIKI_PROXY` env when set (same precedence as `ZIKI_PROVIDER`/`ZIKI_ENDPOINT`/`ZIKI_MODEL`/`ZIKI_API_KEY`); default `""`.
 
 **Checkpoint**: Config exposes `proxy`; env-over-file precedence holds. Transport work can now begin.
 
@@ -50,15 +50,15 @@
 
 ### Tests for User Story 1 (TDD — write FIRST, ensure they FAIL)
 
-- [ ] T005 [P] [US1] [TDD] Write transport test FIRST in `src/provider/transport.zig`: `parseProxy`/`makeProxy` of `"http://localhost:8890"` yields `protocol == .plain`, `host == "localhost"`, `port == 8890`, `supports_connect == true`; `"https://proxy:3128"` yields `.tls`/port 3128; malformed input returns an error.
-- [ ] T006 [P] [US1] [TDD] Write transport test FIRST in `src/provider/transport.zig`: a `HttpTransport` built with `proxy == null` exposes a `null` client proxy field (proves we never call `initDefaultProxies` → system proxy ignored); a transport built with a valid proxy exposes a non-null proxy with the correct host/port.
+- [ ] T005 [P] [US1] [TDD] [U5,U6,U8] Write transport test FIRST in `src/provider/transport.zig`: `parseProxy`/`makeProxy` of `"http://localhost:8890"` yields `protocol == .plain`, `host == "localhost"`, `port == 8890`, `supports_connect == true`; `"https://proxy:3128"` yields `.tls`/port 3128; malformed input returns an error.
+- [ ] T006 [P] [US1] [TDD] [U9,U10] Write transport test FIRST in `src/provider/transport.zig`: a `HttpTransport` built with `proxy == null` exposes a `null` client proxy field (proves we never call `initDefaultProxies` → system proxy ignored); a transport built with a valid proxy exposes a non-null proxy with the correct host/port.
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] Implement `makeProxy(alloc, url) !?*std.http.Client.Proxy` in `src/provider/transport.zig` using `std.Uri` (scheme→protocol, host, port default 80/443, `authorization = null`, `supports_connect = true`); return error on unparseable input.
-- [ ] T008 [US1] Change `HttpTransport.init(alloc, proxy: ?[]const u8) !HttpTransport` in `src/provider/transport.zig` to parse the proxy at init (startup, before any request) and store `proxy: ?*std.http.Client.Proxy`; return the parse error so `main.zig` can fail fast (FR-007).
-- [ ] T009 [US1] In `HttpTransport.request` (`src/provider/transport.zig`), after creating the per-request `std.http.Client`, assign `client.http_proxy = self.proxy` and `client.https_proxy = self.proxy` when set; never call `initDefaultProxies` (FR-005).
-- [ ] T010 [US1] Pass `cfg.proxy` into the transport in `src/main.zig` `runGoal`: `var transport = HttpTransport.init(alloc, cfg.proxy) catch { emitErr("invalid proxy URL"); return; };`
+- [ ] T007 [US1] [U5,U6,U8] Implement `makeProxy(alloc, url) !?*std.http.Client.Proxy` in `src/provider/transport.zig` using `std.Uri` (scheme→protocol, host, port default 80/443, `authorization = null`, `supports_connect = true`); return error on unparseable input.
+- [ ] T008 [US1] [U8,U9,U10] Change `HttpTransport.init(alloc, proxy: ?[]const u8) !HttpTransport` in `src/provider/transport.zig` to parse the proxy at init (startup, before any request) and store `proxy: ?*std.http.Client.Proxy`; return the parse error so `main.zig` can fail fast (FR-007).
+- [ ] T009 [US1] [U11,U12] In `HttpTransport.request` (`src/provider/transport.zig`), after creating the per-request `std.http.Client`, assign `client.http_proxy = self.proxy` and `client.https_proxy = self.proxy` when set; never call `initDefaultProxies` (FR-005).
+- [ ] T010 [US1] [U13] Pass `cfg.proxy` into the transport in `src/main.zig` `runGoal`: `var transport = HttpTransport.init(alloc, cfg.proxy) catch { emitErr("invalid proxy URL"); return; };`
 
 **Checkpoint**: US1 functional. A goal with a valid proxy set completes identically to a direct run; malformed proxy aborts at startup.
 
@@ -72,17 +72,33 @@
 
 ### Implementation for User Story 2
 
-- [ ] T011 [US2] Confirm `src/provider/transport.zig` never references `initDefaultProxies` and `HttpTransport.request` only sets proxy fields when `self.proxy != null`; add a comment asserting the deliberate opt-out of system proxy auto-detection (FR-005). No new branching in provider/executor code (OCP).
+- [ ] T011 [US2] [U11] Confirm `src/provider/transport.zig` never references `initDefaultProxies` and `HttpTransport.request` only sets proxy fields when `self.proxy != null`; add a comment asserting the deliberate opt-out of system proxy auto-detection (FR-005). No new branching in provider/executor code (OCP).
 
 **Checkpoint**: US2 functional. System proxy env vars are ignored unless `proxy` is explicitly configured.
+
+---
+
+## Phase 4b: Close coverage gaps (brownfield)
+
+The feature is already implemented; `tdd/test-list.md` records the behaviors
+below as `PENDING` with no test. Add the missing tests (characterization /
+integration). Do NOT change behavior.
+
+- [x] T016 [US1] [TDD] [U7] Add transport test in `src/provider/transport.zig`: `makeProxy("https://proxy.example.com:3128")` yields `.tls` / port `3128` (explicit https port; today only the default-port case is asserted).
+- [x] T017 [US1] [TDD] [U11] Add a test that `HttpTransport.request` (HTTP target) assigns `client.http_proxy`/`client.https_proxy` from the configured proxy and never calls `initDefaultProxies`. Use a local proxy fixture (e.g. `tmp_mock_server.py` style) or an integration harness; assert the request is routed through it.
+- [ ] T018 [US1] [TDD] [U12] DEFERRED — HTTPS-through-proxy `requestViaConnectTls` (manual CONNECT + TLS) coverage moved to `src/provider/transport_tls.zig` (not collected by `tests.zig`); out of scope for the non-TLS scenario. Run via `zig test src/provider/transport_tls.zig` when TLS is in scope.
+- [ ] T019 [US2] [TDD] [U13] Add a test or live assertion that `main.runGoal` passes `cfg.proxy` into `HttpTransport.init` and fast-fails with `error: invalid proxy URL in configuration` on a malformed proxy (covers FR-007 startup path; live `quickstart.md` Scenario D).
+- [x] T020 [US1] [TDD] [U4] Add config test: with no `ZIKI_PROXY` and no `proxy` key in the config file, `Config.proxy == ""` (direct-connection default).
+
+**Checkpoint**: Every `PENDING` inner behavior (U13) has a test; the suite stays green and the live scenarios B–E still pass.
 
 ---
 
 ## Phase 5: Polish & Cross-Cutting Concerns
 
 - [ ] T012 [P] Document the `proxy` config field and `ZIKI_PROXY` env override in `README.md` (add to the config block; note system proxy auto-detection is disabled).
-- [ ] T013 Run `zig build test --summary all` and confirm all tests green (no regression).
-- [ ] T014 Live-verify quickstart scenarios B, C, D, E: direct run, proxied run through `http://localhost:8890`, malformed-proxy fast-fail, and system-proxy-ignored.
+- [x] T013 [A2] Run `zig build test --summary all` and confirm all tests green (no regression).
+- [x] T014 [A1,A2,A3,A4] Live-verify quickstart scenarios B, C, D, E: direct run, proxied run through `http://localhost:8890`, malformed-proxy fast-fail, and system-proxy-ignored.
 - [ ] T015 Commit, open PR against MASTER, merge, and pull.
 
 ---

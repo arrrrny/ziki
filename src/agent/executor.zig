@@ -319,6 +319,13 @@ fn runCapture(alloc: Allocator, argv: []const []const u8) ![]u8 {
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     child.spawn() catch return alloc.dupe(u8, "");
+    // ChildProcess has no deinit() in this Zig version, so the pipe fds (and the
+    // std.fs.File buffers wrapping them) leak when `child` leaves scope. Close
+    // them explicitly on every return path.
+    defer {
+        if (child.stdout) |s| s.close();
+        if (child.stderr) |e| e.close();
+    }
     const fd = child.stdout.?.handle;
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
     var tmp: [4096]u8 = undefined;

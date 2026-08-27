@@ -111,6 +111,12 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
     defer out_buf.deinit(alloc);
     var err_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer err_buf.deinit(alloc);
+    // ChildProcess has no deinit() in this Zig version; close the pipe fds
+    // (and their wrapping std.fs.File buffers) explicitly to avoid leaking them.
+    defer {
+        if (child.stdout) |s| s.close();
+        if (child.stderr) |e| e.close();
+    }
 
     const out_fd = child.stdout.?.handle;
     const err_fd = child.stderr.?.handle;

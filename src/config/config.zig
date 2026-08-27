@@ -150,6 +150,26 @@ test "load exposes proxy from config/env without mutating env" {
     }
 }
 
+test "config proxy is empty (direct connection) when env and file leave it unset" {
+    const alloc = std.testing.allocator;
+    const env_proxy = std.process.getEnvVarOwned(alloc, "ZIKI_PROXY") catch null;
+    defer if (env_proxy) |e| alloc.free(e);
+    const cfg = try load(alloc);
+    defer cfg.deinit(alloc);
+    if (env_proxy) |e| {
+        try std.testing.expectEqualStrings(e, cfg.proxy);
+    } else {
+        const file_proxy = readConfigProxy(alloc) catch "";
+        defer if (file_proxy.len > 0) alloc.free(file_proxy);
+        try std.testing.expectEqualStrings(file_proxy, cfg.proxy);
+        // Direct-connection default (FR-003): with neither env nor file setting
+        // a proxy, Config.proxy must be "" so the transport connects directly.
+        if (file_proxy.len == 0) {
+            try std.testing.expectEqualStrings("", cfg.proxy);
+        }
+        }
+}
+
 /// Test helper: read only the `proxy` field from the resolved config file.
 /// Returns an empty slice when the file or field is absent.
 fn readConfigProxy(alloc: Allocator) ![]const u8 {

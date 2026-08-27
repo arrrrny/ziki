@@ -194,6 +194,10 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         .verbose = verbose,
         .clean_tree = clean_tree,
     };
+    // FR-006: the job report is allocated inside the run (finalizeReport). Free it
+    // on every exit path, including when ex.run() throws (the explicit free below
+    // would otherwise be skipped and the buffer would leak).
+    defer if (ex.report) |r| alloc.free(r);
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
     defer goal.deinit(alloc);
@@ -206,7 +210,6 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     if (ex.report) |r| {
         try emit("job report:", .{});
         try emit("{s}", .{r});
-        alloc.free(r);
     }
     const push_line = if (bt.push_occurred)
         "push: occurred"
