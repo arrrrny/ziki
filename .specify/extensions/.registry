@@ -18,7 +18,92 @@
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-22T16:23:47.483957+00:00"
+      "installed_at": "2026-08-26T14:35:36.766021+00:00"
+    },
+    "git": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:47ea781a2c984fb3fe4c2627aae17ac22db2d07f99ada3301cf2960afc4c3d4f",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "kimi": [
+          "speckit.git.feature",
+          "speckit.git.validate",
+          "speckit.git.remote",
+          "speckit.git.initialize",
+          "speckit.git.commit"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-08-26T14:35:40.796583+00:00"
+    },
+    "gh-triage": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:50f974a4c951ca1645dbf07bde780b9daa66e014c90e856cea7c413ae93902eb",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "kimi": [
+          "speckit.gh-triage.triage"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-08-26T14:35:44.953869+00:00"
+    },
+    "gym": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:d25a2852cc2fc7fa396412cf83c19e271668fc8a351c20dbf87d6eec8c211743",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "kimi": [
+          "speckit.gym.init",
+          "speckit.gym.run",
+          "speckit.gym.warmup",
+          "speckit.gym.gate",
+          "speckit.gym.drop"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-08-26T14:35:49.024350+00:00"
+    },
+    "tdd": {
+      "version": "1.1.2",
+      "source": "local",
+      "manifest_hash": "sha256:39534941d021fbaec6e9bd6a7df182d6751ac807deb907f599850abdba3a5e74",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "kimi": [
+          "speckit.tdd.setup",
+          "speckit.tdd.plan",
+          "speckit.tdd.run",
+          "speckit.tdd.verify"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-08-26T14:35:54.050492+00:00"
+    },
+    "chore": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:ae455f9153a5ec3d4d9fed41efb1c6c5c66f22e1dd43fbd3a98bb2d728fb65b6",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "kimi": [
+          "speckit.chore.assess",
+          "speckit.chore.issue",
+          "speckit.chore.fetch",
+          "speckit.chore.implement",
+          "speckit.chore.pr"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-08-26T14:35:59.894429+00:00"
     }
   }
 }
