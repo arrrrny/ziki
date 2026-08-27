@@ -7,6 +7,10 @@ const HttpTransport = @import("provider/transport.zig").HttpTransport;
 const RealFs = @import("fs/fs.zig").RealFs;
 const Fs = @import("fs/fs.zig").Fs;
 const GoalExecutor = @import("agent/executor.zig").GoalExecutor;
+const state = @import("agent/state.zig");
+const herdr = @import("agent/herdr.zig");
+const Transport = @import("provider/transport.zig").Transport;
+const FakeTransport = @import("provider/transport.zig").FakeTransport;
 const Goal = @import("goal/goal.zig").Goal;
 const Status = @import("goal/goal.zig").Status;
 const FsGoalRepository = @import("goal/repository.zig").FsGoalRepository;
@@ -73,6 +77,42 @@ fn writeSessionProvider(alloc: Allocator, state_dir: []const u8, name: []const u
 // Command handlers. Each wraps the existing logic behind the Handler interface
 // so the dispatcher stays command-agnostic (SC-005, DIP).
 // ---------------------------------------------------------------------------
+
+/// AnyWriter that emits to stdout (fd 1). Used by the Herdr state publisher to
+/// write the `[ziki-state: ...]` screen marker and OSC title. `std.fs.File`
+/// lacks the new `Writer.any()` helper, so we build the `AnyWriter` directly.
+fn stdoutWriteFn(_: *const anyopaque, bytes: []const u8) anyerror!usize {
+    return std.fs.File.stdout().write(bytes);
+}
+fn stdoutAnyWriter() std.io.AnyWriter {
+    return .{ .context = undefined, .writeFn = stdoutWriteFn };
+}
+
+/// Build the Herdr `StatePublisher` for a goal (spec 011, FR-008).
+///
+/// When `pane_id` is set, resolves the Herdr API URL and builds a real
+/// `HerdrHttpClient` reporter (stored in `herdr_client_slot`, which the caller
+/// owns and keeps alive for the run) so Ziki pushes state to Herdr. When
+/// `pane_id` is null, returns a publisher with `reporter = null`: it still
+/// emits the screen marker + OSC title but never pushes (degraded mode).
+fn buildStatePublisher(
+    alloc: Allocator,
+    transport: Transport,
+    pane_id: ?[]const u8,
+    goal_id: []const u8,
+    state_dir: []const u8,
+    herdr_client_slot: *?herdr.HerdrHttpClient,
+    writer: std.io.AnyWriter,
+) !state.StatePublisher {
+    var reporter: ?state.HerdrReporter = null;
+    if (pane_id) |_| {
+        const api_url = try herdr.resolveApiUrl(alloc);
+        herdr_client_slot.* = herdr.HerdrHttpClient.init(alloc, transport, api_url);
+        reporter = (herdr_client_slot.*).?.toReporter();
+        alloc.free(api_url);
+    }
+    return state.StatePublisher.init(alloc, reporter, writer, pane_id orelse "", goal_id, state_dir);
+}
 
 fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs) !void {
     if (tokens.len < 2) {
@@ -197,6 +237,14 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
     defer goal.deinit(alloc);
+
+    // Spec 011: wire the Herdr state publisher. `buildStatePublisher` reads
+    // HERDR_PANE_ID and builds a real reporter when present, or a null-reporter
+    // publisher (screen markers + OSC only) when absent (FR-008).
+    const stdout_writer = stdoutAnyWriter();
+    var herdr_client_slot: ?herdr.HerdrHttpClient = null;
+    ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), std.posix.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, stdout_writer);
+
     try emitStatus(.active);
     try ex.run(&goal);
     try emitStatus(goal.status);
@@ -419,4 +467,30 @@ pub fn main() !void {
     };
     if (result.output.len > 0) try emit("{s}", .{result.output});
     alloc.free(result.output);
+}
+
+test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null otherwise (U19)" {
+    const alloc = std.testing.allocator;
+    var ft = FakeTransport.init(200, "");
+    const t = ft.toTransport();
+
+    var slot: ?herdr.HerdrHttpClient = null;
+    var wbuf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&wbuf);
+    const w = fbs.writer().any();
+    const with = try buildStatePublisher(alloc, t, "pane-9", "goal-9", "/wd", &slot, w);
+    try std.testing.expect(with.reporter != null);
+    try std.testing.expect(slot != null); // client retained for the run's lifetime
+
+    var slot2: ?herdr.HerdrHttpClient = null;
+    var without = try buildStatePublisher(alloc, t, null, "goal-10", "/wd", &slot2, w);
+    try std.testing.expect(without.reporter == null);
+    try std.testing.expect(slot2 == null);
+
+    // The no-reporter publisher is still safe to publish (degraded mode).
+    var buf: [256]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&buf);
+    without.writer = fbs2.writer().any();
+    without.publish(.working, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..fbs2.pos], "[ziki-state: working]") != null);
 }
