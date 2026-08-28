@@ -51,7 +51,45 @@ context window vomits. State persists to disk. Resume survives a crash.
   helper function. Swap the filesystem, swap the transport, the logic doesn't
   flinch.
 - **Provider boundary** — one interface, six presets. Bring your own endpoint.
+- **Skills** — drop a `SKILL.md` in a skills directory and the agent can use
+  it, exactly like any coding editor. Just like kimi.
 - **Low-footprint runtime** — this is the whole point. We measured. It's rude.
+
+## SKILLS
+
+A skill is a `SKILL.md` file — YAML frontmatter (`name`, `description`) and a
+markdown body of instructions:
+
+```markdown
+---
+name: code-review
+description: Review code for SOLID violations
+---
+## Steps
+1. Read the diff
+2. Check every principle
+```
+
+Ziki discovers skills from three roots, highest precedence first:
+
+| Root | Lives | Committed? |
+|------|-------|------------|
+| `.ziki/skills/` | this project, this machine | no (local overrides) |
+| `.kimi-code/skills/` | this project, the team | yes (kimi-code compatible) |
+| `~/.config/ziki/skills/` | every project, you | your call |
+
+Same name in two roots? The higher root wins. Malformed skill? Skipped with a
+warning — it never takes the agent down. Zero skills? `/goal` behaves exactly
+as without them.
+
+During a goal, every skill's name and description is in the agent's context,
+and the model fetches a skill's full instructions on demand through the
+`skill` tool. Interactive users inspect the same registry:
+
+```
+/skill list            # name, description, source — plus load warnings
+/skill show <name>     # the full instructions, verbatim
+```
 
 ## THE GYM (GROW YOUR MUSCLES)
 

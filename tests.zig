@@ -22,6 +22,10 @@ const herdr = @import("src/agent/herdr.zig");
 const main_mod = @import("src/main.zig");
 const config = @import("src/config/config.zig");
 const shell_test = @import("src/shell/shell_test.zig");
+const skill = @import("src/skill/skill.zig");
+const skill_registry = @import("src/skill/registry.zig");
+const skill_tool = @import("src/skill/tool.zig");
+const skill_handler = @import("src/skill/handler.zig");
 
 test "aggregator loads all modules" {
     _ = std.testing;
@@ -45,4 +49,8 @@ test "aggregator loads all modules" {
     _ = herdr;
     _ = main_mod;
     _ = config;
+    _ = skill;
+    _ = skill_registry;
+    _ = skill_tool;
+    _ = skill_handler;
 }

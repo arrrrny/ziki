@@ -3,4 +3,5 @@ zig-out/
 .ziki/
 *.o
 *.a
+.zig-cache/
 .worktrees/

@@ -21,6 +21,12 @@ pub const GoalExecutor = struct {
     dir: []const u8,
     session_id: []const u8,
     verbose: bool = false,
+    /// Preformatted skill listing (FR-005): one "- name: description" line
+    /// per skill, appended to the system prompt. Null or empty means no
+    /// skills were discovered and the prompt is byte-identical to the
+    /// pre-feature behavior (FR-010). Built by the composition root from the
+    /// SkillRegistry — the executor stays ignorant of the skill domain (ISP).
+    skills_listing: ?[]const u8 = null,
     /// When true (default), the executor reverts uncommitted drift the agent
     /// introduced this run but did not intentionally change, leaving the tree
     /// clean (FR-005). Disabled with `--no-clean`.
@@ -68,6 +74,15 @@ pub const GoalExecutor = struct {
         for (self.tools) |t| {
             const s = t.schema();
             try std.fmt.format(sb.writer(self.alloc), "Tool {s}: {s}\n", .{ s.name, s.description });
+        }
+        if (self.skills_listing) |listing| {
+            if (listing.len > 0) {
+                try sb.writer(self.alloc).writeAll(
+                    \\Skills you can consult — use the skill tool with the exact name to get its full instructions:
+                    \\
+                );
+                try sb.writer(self.alloc).writeAll(listing);
+            }
         }
         return sb.toOwnedSlice(self.alloc);
     }
@@ -548,6 +563,36 @@ test "GoalExecutor retries transient provider errors and still completes" {
     try std.testing.expect(goal.status == .completed);
 }
 
+test "system prompt appends the skills listing when provided (FR-005)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const ok = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "done" } };
+    var scripted = @import("../provider/fake.zig").FakeProvider.init(&.{ok});
+    const fp = scripted.toProvider();
+
+    const tools = [_]Tool{};
+    var repo_impl = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .skills_listing = "- code-review: Review code for SOLID violations\n",
+    };
+    const sp = try ex.systemPrompt();
+    defer alloc.free(sp);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "Skills you can consult") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "- code-review: Review code for SOLID violations") != null);
+}
+
 /// Test/cleanup helper: run `git -C <cwd> <args>`, ignoring output (non-fatal).
 fn runGit(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {
     var argv = try std.ArrayList([]const u8).initCapacity(alloc, 0);
@@ -676,4 +721,49 @@ test "GoalExecutor records a job report of changed files (FR-006)" {
     try std.testing.expect(std.mem.indexOf(u8, r, "changed:") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "hello.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "skipped:\n  (none)") != null);
+}
+
+test "system prompt is unchanged when no skills listing is set (FR-010)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const ok = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "done" } };
+    var scripted = @import("../provider/fake.zig").FakeProvider.init(&.{ok});
+    const fp = scripted.toProvider();
+
+    const tools = [_]Tool{};
+    var repo_impl = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+
+    var with_listing: GoalExecutor = .{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    // Default: null listing -> no skills section at all.
+    var without: GoalExecutor = .{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    with_listing.skills_listing = null;
+    without.skills_listing = "";
+
+    const a = try with_listing.systemPrompt();
+    defer alloc.free(a);
+    const b = try without.systemPrompt();
+    defer alloc.free(b);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Skills you can consult") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "Skills you can consult") == null);
+    try std.testing.expectEqualStrings(a, b);
 }
