@@ -471,7 +471,10 @@ pub fn main() !void {
 
     // Skills (FR-002): discover once per invocation; the registry is shared
     // by /goal (system-prompt listing + skill tool) and /skill (list/show).
-    const skill_roots = skill_registry.defaultRoots(alloc, cwd) catch &[_][]const u8{};
+    // `defaultRoots` only fails on OutOfMemory. On that path fall back to an
+    // empty, allocator-owned slice (never a comptime literal) so the `defer`
+    // below always frees memory the allocator actually owns.
+    const skill_roots = skill_registry.defaultRoots(alloc, cwd) catch try alloc.alloc([]const u8, 0);
     defer {
         for (skill_roots) |r| alloc.free(r);
         alloc.free(skill_roots);
