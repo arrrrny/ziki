@@ -1,0 +1,19 @@
+error: ProviderError
+/Users/ahmettok/Developer/ziki/src/provider/openai.zig:61:13: 0x1001bf470 in complete (ziki)
+            return error.ProviderError;
+            ^
+/Users/ahmettok/Developer/ziki/src/provider/provider.zig:88:9: 0x10019e835 in complete (ziki)
+        return self.vtable.complete(self.ctx, alloc, req);
+        ^
+/Users/ahmettok/Developer/ziki/src/agent/executor.zig:113:26: 0x1001a0c07 in run (ziki)
+            const resp = try self.provider.complete(a, .{ .messages = messages.items, .tools = specs });
+                         ^
+/Users/ahmettok/Developer/ziki/src/main.zig:163:5: 0x1001a4158 in runGoal (ziki)
+    try ex.run(&goal);
+    ^
+/Users/ahmettok/Developer/ziki/src/main.zig:212:9: 0x1001a69b5 in dispatch (ziki)
+        try runGoal(alloc, tokens, state_dir, fs_iface);
+        ^
+/Users/ahmettok/Developer/ziki/src/main.zig:300:5: 0x1001a8832 in main (ziki)
+    try dispatch(alloc, cli_tokens, state_dir, fs_iface);
+    ^

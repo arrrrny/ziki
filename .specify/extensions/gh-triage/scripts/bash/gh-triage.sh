@@ -13,21 +13,29 @@
 # isolation.
 #
 # Usage:
-#   gh-triage.sh [run|list|classify|label] [options]
+#   gh-triage.sh [run|list|classify|label|feature] [options]
 #
 # Subcommands:
 #   run       (default) fetch, classify, and label issues (respects auto_label)
 #   list      print open issues as JSON and exit (no classify/label)
 #   classify  fetch + classify, print the triage plan, do NOT label
 #   label     alias for `run`
+#   feature   create a GitHub issue describing a new feature (no classify/label)
 #
-# Options:
+# Options (shared):
 #   --repo OWNER/REPO   override the repo (else config.repo, else git remote)
+#   --config PATH       path to gh-triage-config.yml
+#   --json              emit machine-readable output (JSON)
+#
+# Options (triage only):
 #   --limit N           max issues to triage (0 = all)
 #   --issue N           triage a single issue number instead of the open list
-#   --config PATH       path to gh-triage-config.yml
 #   --dry-run           classify + report labels, but do not apply them
-#   --json              emit the triage plan as JSON
+#
+# Options (feature only):
+#   --title "<t>"       feature issue title (required)
+#   --body "<b>"        feature issue body (defaults to the title)
+#   --label "<l>"       label to apply (default: config labels.feature; "" = none)
 #
 # Dependencies: gh (GitHub CLI, authenticated), jq. No yq/PyYAML required.
 
@@ -79,16 +87,22 @@ ARG_REPO=""
 ARG_LIMIT=""
 ARG_ISSUE=""
 ARG_CONFIG=""
+ARG_TITLE=""
+ARG_BODY=""
+ARG_LABEL=""
 DRY_RUN="false"
 AS_JSON="false"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    run|list|classify|label) SUBCMD="$1" ;;
+    run|list|classify|label|feature) SUBCMD="$1" ;;
     --repo) ARG_REPO="${2:-}"; shift ;;
     --limit) ARG_LIMIT="${2:-}"; shift ;;
     --issue) ARG_ISSUE="${2:-}"; shift ;;
     --config) ARG_CONFIG="${2:-}"; shift ;;
+    --title) ARG_TITLE="${2:-}"; shift ;;
+    --body) ARG_BODY="${2:-}"; shift ;;
+    --label) ARG_LABEL="${2:-}"; shift ;;
     --dry-run) DRY_RUN="true" ;;
     --json) AS_JSON="true" ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
@@ -354,9 +368,63 @@ apply_labels() {
 }
 
 # ---------------------------------------------------------------------------
+# Feature issue creation
+# ---------------------------------------------------------------------------
+# Create a GitHub issue describing a new feature. The deterministic issue
+# creation (gh issue create) happens here; the optional downstream "turn this
+# into a spec" step is performed by the agent following the command markdown
+# (it calls speckit.specify), so this subcommand stays testable in isolation.
+feature_create() {
+  require_gh
+  load_config
+  resolve_repo
+
+  local title="$ARG_TITLE" body="$ARG_BODY"
+  if [ -z "$title" ]; then
+    echo "gh-triage feature: --title is required" >&2
+    exit 2
+  fi
+  [ -z "$body" ] && body="$title"
+
+  # Pick the label: explicit --label wins; else config labels.feature; "" disables.
+  local label="${ARG_LABEL:-$LABELS_FEATURE}"
+
+  # Only apply the label if it actually exists in the target repo (never
+  # force-create labels, matching the triage engine's behavior).
+  if [ -n "$label" ]; then
+    local repolabels="$(fetch_repo_labels)"
+    if ! label_exists "$label" "$repolabels"; then
+      echo "  ! skip label '$label' (not present in repo $REPO)" >&2
+      label=""
+    fi
+  fi
+
+  local args=(issue create --repo "$REPO" --title "$title" --body "$body")
+  [ -n "$label" ] && args+=(--label "$label")
+
+  if [ "$AS_JSON" = "true" ]; then
+    local out
+    out="$(gh "${args[@]}" --json url,number 2>/dev/null)"
+    [ -z "$out" ] && { echo "gh-triage feature: failed to create issue in $REPO" >&2; exit 1; }
+    printf '%s\n' "$out"
+  else
+    local url
+    url="$(gh "${args[@]}" 2>/dev/null)"
+    [ -z "$url" ] && { echo "gh-triage feature: failed to create issue in $REPO" >&2; exit 1; }
+    echo "gh-triage: created feature issue #${url##*/} in $REPO"
+    echo "$url"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
+  if [ "$SUBCMD" = "feature" ]; then
+    feature_create "$@"
+    return 0
+  fi
+
   require_gh
   load_config
   resolve_repo

@@ -20,7 +20,7 @@ result is a genuinely usable, running `ziki` binary.
 
 ## Phase 1: Setup (Shared Infrastructure)
 
-- [ ] T001 Create project directory structure per plan.md: `build.zig`, `src/{cli,agent,provider,tool,goal,fs,config}/`, `.gitignore`
+- [x] T001 Create project directory structure per plan.md: `build.zig`, `src/{cli,agent,provider,tool,goal,fs,config}/`, `.gitignore`
 - [ ] T002 [P] Write `build.zig` with an `exe` step (`ziki`) and a `test` step aggregating all `_test.zig`
 - [ ] T003 [P] Add `.gitignore` entries (`zig-out/`, `.ziki/`)
 
@@ -64,12 +64,12 @@ fake provider completes the goal and prints `status: completed` (Scenario C).
 
 ### Implementation for User Story 1
 
-- [ ] T012 [US1] Implement `FakeProvider` in `src/provider/fake.zig` (satisfies `Provider` vtable; deterministic scripted responses)
-- [ ] T014 [US1] Implement `GoalExecutor` loop in `src/agent/executor.zig`: assemble messages + tool schemas, call `provider.complete`, execute `tool_calls` via `Tool`, evaluate completion/criterion, enforce budgets (turns/tokens/time), persist via `GoalRepository` each turn, honor `/stop` (FR-002/003/008)
-- [ ] T016 [US1] Implement `OpenAIProvider` (OpenAI-compatible Chat Completions over `Transport`) in `src/provider/openai.zig` (reference provider, spec 004)
+- [x] T012 [US1] Implement `FakeProvider` in `src/provider/fake.zig` (satisfies `Provider` vtable; deterministic scripted responses)
+- [x] T014 [US1] Implement `GoalExecutor` loop in `src/agent/executor.zig`: assemble messages + tool schemas, call `provider.complete`, execute `tool_calls` via `Tool`, evaluate completion/criterion, enforce budgets (turns/tokens/time), persist via `GoalRepository` each turn, honor `/stop` (FR-002/003/008)
+- [x] T016 [US1] Implement `OpenAIProvider` (OpenAI-compatible Chat Completions over `Transport`) in `src/provider/openai.zig` (reference provider, spec 004)
 - [ ] T017b [US1] Implement `ReadTool`, `EditTool`, `SearchTool`, `BashTool` in `src/tool/{read,edit,search,bash}.zig` over injected `Fs` (FR-007 tool parity)
 - [ ] T019 [US1] Implement CLI parser/dispatcher `src/cli/cli.zig` (FR-001, FR-008, FR-010 error contract from contracts/cli-commands.md)
-- [ ] T020 [US1] Implement composition root `src/main.zig`: load `Config`, select provider (preset or `FakeProvider` when env-gated), wire tools (`RealFs`), `FsGoalRepository`, `GoalExecutor`, run REPL printing status/summary per contract
+- [x] T020 [US1] Implement composition root `src/main.zig`: load `Config`, select provider (preset or `FakeProvider` when env-gated), wire tools (`RealFs`), `FsGoalRepository`, `GoalExecutor`, run REPL printing status/summary per contract
 - [ ] T021 [US1] Add integration test wiring the full binary path (executor e2e verified without network) — reference quickstart Scenario B
 
 **Checkpoint**: User Story 1 independently functional — `/goal` completes end-to-end (FakeProvider-backed test green; real provider path builds). This is the shippable MVP.
@@ -135,7 +135,7 @@ memory-budget test (slice 008) spawns N windows and asserts RSS <= threshold.
 
 ### Implementation for User Story 2
 
-- [ ] T028 [US2] Implement per-turn arena reset + bounded message history with compaction in `src/agent/executor.zig` (FR-009, spec context edge case)
+- [x] T028 [US2] Implement per-turn arena reset + bounded message history with compaction in `src/agent/executor.zig` (FR-009, spec context edge case)
 - [ ] T029 [US2] Add memory-budget harness/test scaffolding (slice 008): spawn N `ziki` subprocesses, measure RSS, assert <= threshold (SC-002)
 
 **Checkpoint**: Memory discipline in place; formal budget gate lives in slice 008.

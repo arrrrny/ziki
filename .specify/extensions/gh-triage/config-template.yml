@@ -27,6 +27,16 @@ auto_fix: false
 #            want gh-triage to implement chores.
 auto_implement: false
 
+# Whether the `feature` command automatically runs speckit.specify after filing
+# the feature issue.
+#   false -> `feature` only creates the GitHub issue. You either run
+#            speckit.specify yourself later, or pass --specify to force it for a
+#            single run. This is the safe default.
+#   true  -> after creating the issue, `feature` automatically runs
+#            speckit.specify to turn the request into a spec under specs/.
+# The --specify flag on the command overrides this for a single run.
+auto_specify: false
+
 # Repository to triage, as owner/repo (e.g. github/spec-kit).
 # Empty -> inferred from the current git remote.origin.url (must point to
 # github.com). Override here to triage a different repo than the one checked out.

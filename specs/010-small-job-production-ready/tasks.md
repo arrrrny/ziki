@@ -24,7 +24,7 @@ net-new code.
 prepares the feature branch and confirms the build/test baseline.
 
 - [ ] T001 Create branch `010-small-job-production-ready` from current HEAD and confirm `zig build` and `zig build test` baseline pass
-- [ ] T002 Confirm FR-004 is already satisfied: `--criterion` parsed in `src/main.zig`, stored on `Goal`, and routed through `verify()` in `src/agent/executor.zig` (no net-new code)
+- [x] T002 Confirm FR-004 is already satisfied: `--criterion` parsed in `src/main.zig`, stored on `Goal`, and routed through `verify()` in `src/agent/executor.zig` (no net-new code)
 
 ---
 
@@ -33,9 +33,9 @@ prepares the feature branch and confirms the build/test baseline.
 **Purpose**: Shared helpers that multiple FRs depend on. Must be complete before
 the user-story phases that use them.
 
-- [ ] T003 [P] Add `fs.expandTilde(alloc, path) ![]u8` free function to `src/fs/fs.zig` (reads `HOME` via `std.process.getEnvVarOwned`; expands `~/x`→`$HOME/x`, bare `~`→`$HOME`; original path returned if no `~` or `HOME` unset)
-- [ ] T004 [P] Add `no_timeout = std.math.maxInt(u64)` and refactor the kill check in `runWithTimeout` (`src/tool/bash.zig`) so a `no_timeout` budget skips the timeout check
-- [ ] T005 [P] Add pure git-status helpers to `src/agent/executor.zig`: `gitStatus(alloc, cwd) []u8` (swallows errors → `""`), `parseStatusPaths([]const u8) [][]const u8`, and `revertIncidental(alloc, cwd, intentional, pre_existing) []const u8`
+- [x] T003 [P] Add `fs.expandTilde(alloc, path) ![]u8` free function to `src/fs/fs.zig` (reads `HOME` via `std.process.getEnvVarOwned`; expands `~/x`→`$HOME/x`, bare `~`→`$HOME`; original path returned if no `~` or `HOME` unset)
+- [x] T004 [P] Add `no_timeout = std.math.maxInt(u64)` and refactor the kill check in `runWithTimeout` (`src/tool/bash.zig`) so a `no_timeout` budget skips the timeout check
+- [x] T005 [P] Add pure git-status helpers to `src/agent/executor.zig`: `gitStatus(alloc, cwd) []u8` (swallows errors → `""`), `parseStatusPaths([]const u8) [][]const u8`, and `revertIncidental(alloc, cwd, intentional, pre_existing) []const u8`
 
 **Checkpoint**: All shared helpers exist; user-story work may begin.
 
@@ -52,13 +52,13 @@ a file ends with a populated `changed` report, a clean tree, and no push. An
 
 ### Tests for User Story 1 ⚠️
 
-- [ ] T006 [US1] Write failing test: `parseStatusPaths` parses `git status --porcelain` output (modified + untracked lines) into path list — `src/agent/executor.zig`
-- [ ] T007 [US1] Write failing integration test: `revertIncidental` over a real temp git repo reverts only drift (modified tracked file + newly-added untracked file), leaving pre-existing/intentional files untouched — `src/agent/executor.zig`
-- [ ] T008 [US1] Write failing test: `GoalExecutor` accumulates a `JobReport` (changed files + skipped + push state) and stores it on the executor after `run` — `src/agent/executor.zig`
+- [x] T006 [US1] Write failing test: `parseStatusPaths` parses `git status --porcelain` output (modified + untracked lines) into path list — `src/agent/executor.zig`
+- [x] T007 [US1] Write failing integration test: `revertIncidental` over a real temp git repo reverts only drift (modified tracked file + newly-added untracked file), leaving pre-existing/intentional files untouched — `src/agent/executor.zig`
+- [x] T008 [US1] Write failing test: `GoalExecutor` accumulates a `JobReport` (changed files + skipped + push state) and stores it on the executor after `run` — `src/agent/executor.zig`
 
 ### Implementation for User Story 1
 
-- [ ] T009 [US1] Wire `JobReport` into `GoalExecutor`: track intentional write/edit paths during `dispatch`, build the report string at terminal state, store on the executor (`src/agent/executor.zig`)
+- [x] T009 [US1] Wire `JobReport` into `GoalExecutor`: track intentional write/edit paths during `dispatch`, build the report string at terminal state, store on the executor (`src/agent/executor.zig`)
 - [ ] T010 [US1] Implement tree cleanup in `GoalExecutor.run`: snapshot `pre_existing` at start, call `revertIncidental` at every terminal state (respect `--no-clean`); never touch pre-existing user state (`src/agent/executor.zig`)
 - [ ] T011 [US1] Print the FR-006 job report in `src/main.zig` after `ex.run` (changed / skipped / push: occurred|blocked|not requested) and add `--no-clean` flag parsing in `runGoal`
 
@@ -78,12 +78,12 @@ clear error.
 
 ### Tests for User Story 2 ⚠️
 
-- [ ] T012 [US2] Write failing test: `isUnauthorizedGitPush` classification in `src/tool/bash.zig`
-- [ ] T013 [US2] Write failing test: `BashTool` with `allow_push=false` refuses an unauthorized `git push` (`ok=false` + "blocked" message); sets `push_blocked`; with `allow_push=true` runs it and sets `push_occurred` on success — `src/tool/bash.zig`
+- [x] T012 [US2] Write failing test: `isUnauthorizedGitPush` classification in `src/tool/bash.zig`
+- [x] T013 [US2] Write failing test: `BashTool` with `allow_push=false` refuses an unauthorized `git push` (`ok=false` + "blocked" message); sets `push_blocked`; with `allow_push=true` runs it and sets `push_occurred` on success — `src/tool/bash.zig`
 
 ### Implementation for User Story 2
 
-- [ ] T014 [US2] Add `allow_push`, `push_blocked`, `push_occurred` fields + `isUnauthorizedGitPush` helper to `src/tool/bash.zig`; gate `execute` before spawning; honor `BashTool.init(fs, allow_push, timeout_seconds)`
+- [x] T014 [US2] Add `allow_push`, `push_blocked`, `push_occurred` fields + `isUnauthorizedGitPush` helper to `src/tool/bash.zig`; gate `execute` before spawning; honor `BashTool.init(fs, allow_push, timeout_seconds)`
 - [ ] T015 [US2] Parse `--allow-push` in `src/main.zig` `runGoal` and pass it (with the timeout) into `BashTool.init`; build the FR-006 push line from `bt.push_occurred`/`bt.push_blocked`
 
 **Checkpoint**: No unguarded push; push status surfaces in the report.
@@ -101,13 +101,13 @@ under a large/`no_timeout` budget with output captured.
 
 ### Tests for User Story 3 ⚠️
 
-- [ ] T016 [US3] Write failing test: `fs.expandTilde` resolves `~/foo`, `~/`, and bare `~` against `$HOME` — `src/fs/fs.zig`
-- [ ] T017 [US3] Write failing test: `BashTool` honors a custom `timeout_seconds` (long `sleep` killed under small budget; completes under large/`no_timeout`) — `src/tool/bash.zig`
+- [x] T016 [US3] Write failing test: `fs.expandTilde` resolves `~/foo`, `~/`, and bare `~` against `$HOME` — `src/fs/fs.zig`
+- [x] T017 [US3] Write failing test: `BashTool` honors a custom `timeout_seconds` (long `sleep` killed under small budget; completes under large/`no_timeout`) — `src/tool/bash.zig`
 
 ### Implementation for User Story 3
 
-- [ ] T018 [US3] Call `expandTilde` inside `RealFs.resolve` (`src/fs/fs.zig`) before the `isAbsolute` check so read/edit/write/search paths all expand `~`
-- [ ] T019 [US3] Pass `timeout_seconds` through `BashTool.execute` → `runWithTimeout`; add `--timeout <N>` and `--no-timeout` flags in `src/main.zig` `runGoal` (default 600)
+- [x] T018 [US3] Call `expandTilde` inside `RealFs.resolve` (`src/fs/fs.zig`) before the `isAbsolute` check so read/edit/write/search paths all expand `~`
+- [x] T019 [US3] Pass `timeout_seconds` through `BashTool.execute` → `runWithTimeout`; add `--timeout <N>` and `--no-timeout` flags in `src/main.zig` `runGoal` (default 600)
 
 **Checkpoint**: `~` paths and long validation both work; US3 independently functional.
 
