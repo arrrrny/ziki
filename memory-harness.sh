@@ -1,69 +1,137 @@
 #!/usr/bin/env bash
 # Memory budget harness for ziki (spec 008).
 #
-# Launches N idle ziki REPL windows, lets them reach steady state, and reports
-# total + per-window resident memory (RSS). Asserts the total against the budget
-# (proxy: ~1.25 GB at 20 windows = 1/8 of the ~10 GB TypeScript baseline).
+# Launches N ziki instances and measures memory: idle steady-state or during
+# active goal execution. Reports total + per-instance peak RSS. Asserts against
+# budget (idle proxy: ~1.25 GB at 20 windows = 1/8 of the ~10 GB TS baseline).
 #
-# Usage: ./memory-harness.sh [N] [budget_kb]
-#   N           number of windows (default 20)
+# Usage: ./memory-harness.sh [mode] [N] [budget_kb]
+#   mode        idle (steady-state REPL, default) or active-goal (execute goals)
+#   N           number of instances (default 20)
 #   budget_kb   total RSS budget in KB (default 1280000 ~ 1.25 GB)
 #
 # Exit 0 = within budget, 1 = breach or launch failure.
 
 set -u
 
-N="${1:-20}"
-BUDGET_KB="${2:-1280000}"
+MODE="${1:-idle}"
+N="${2:-20}"
+BUDGET_KB="${3:-1280000}"
 BIN="${ZIKI_BIN:-./zig-out/bin/ziki}"
 SETTLE_S="${SETTLE_S:-2}"
+GOAL_TIMEOUT_S="${GOAL_TIMEOUT_S:-30}"
+SAMPLE_S="${SAMPLE_S:-20}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "error: ziki binary not found at '$BIN' (build with 'zig build')" >&2
   exit 1
 fi
 
-# A FIFO held open on the write end keeps every window blocked reading stdin
-# (no EOF) so they remain alive at steady state until we kill them.
-fifo="$(mktemp -u)"
-mkfifo "$fifo"
-exec 3<>"$fifo"
+if [[ "$MODE" != "idle" && "$MODE" != "active-goal" ]]; then
+  echo "error: mode must be 'idle' or 'active-goal'" >&2
+  exit 1
+fi
 
-echo "launching $N idle ziki windows from $BIN ..."
+TMPDIR="$(mktemp -d)"
 pids=()
-for ((i = 0; i < N; i++)); do
-  # Redirect child stdout/stderr to /dev/null so they never hold our pipeline open.
-  "$BIN" < "$fifo" >/dev/null 2>&1 &
-  pids+=($!)
-done
+fifo=""
 
-# Let memory settle (allocator bookkeeping, first load, etc.).
-sleep "$SETTLE_S"
+cleanup() {
+  if (( ${#pids[@]} > 0 )); then
+    kill -KILL "${pids[@]}" 2>/dev/null
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
+  if [[ -n "$fifo" && -e "$fifo" ]]; then
+    rm -f "$fifo" 2>/dev/null || true
+  fi
+  rm -rf "$TMPDIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+if [[ "$MODE" == "idle" ]]; then
+  # Idle mode: FIFO held open keeps windows blocked reading stdin at steady state.
+  fifo="$(mktemp -u)"
+  mkfifo "$fifo"
+  exec 3<>"$fifo"
+
+  echo "launching $N idle ziki instances from $BIN ..."
+  for ((i = 0; i < N; i++)); do
+    "$BIN" < "$fifo" >/dev/null 2>&1 &
+    pids+=($!)
+  done
+
+  # Let memory settle (allocator bookkeeping, first load, etc.).
+  sleep "$SETTLE_S"
+
+  # Sample steady-state RSS.
+  declare -A peak
+  for pid in "${pids[@]}"; do peak[$pid]=0; done
+  for ((s = 0; s < SAMPLE_S; s += 1)); do
+    for pid in "${pids[@]}"; do
+      rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+      if [[ -n "$rss" && "$rss" -gt "${peak[$pid]}" ]]; then
+        peak[$pid]="$rss"
+      fi
+    done
+    sleep 1
+  done
+else
+  # Active-goal mode: launch windows, sample peak RSS while they run, then
+  # wait for completion. The sampler must run concurrently — goals finish
+  # quickly and the process exits before a post-hoc poll would see it.
+  echo "launching $N active-goal ziki instances from $BIN ..."
+  declare -A peak
+  for ((i = 0; i < N; i++)); do
+    state_dir="$TMPDIR/state-$i"
+    mkdir -p "$state_dir"
+
+    input_fifo="$TMPDIR/input-$i"
+    mkfifo "$input_fifo"
+
+    {
+      echo "/goal Write test-$i.txt with value-$i. --criterion test-$i.txt exists --timeout $GOAL_TIMEOUT_S"
+      sleep $((GOAL_TIMEOUT_S + 5))
+    } > "$input_fifo" &
+
+    HOME="$state_dir" "$BIN" < "$input_fifo" >"$state_dir/stdout.log" 2>&1 &
+    pid=$!
+    pids+=($pid)
+    peak[$pid]=0
+  done
+
+  for ((s = 0; s < SAMPLE_S; s += 1)); do
+    for pid in "${pids[@]}"; do
+      rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+      if [[ -n "$rss" && "$rss" -gt "${peak[$pid]}" ]]; then
+        peak[$pid]="$rss"
+      fi
+    done
+    sleep 1
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+fi
 
 total_kb=0
 for pid in "${pids[@]}"; do
-  rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
-  if [[ -z "$rss" ]]; then
-    echo "error: window pid $pid is not running" >&2
-    kill -KILL "${pids[@]}" 2>/dev/null
-    exec 3>&-
-    rm -f "$fifo"
+  if (( peak[$pid] == 0 )); then
+    echo "error: window pid $pid produced no RSS sample" >&2
     exit 1
   fi
-  total_kb=$((total_kb + rss))
+  total_kb=$((total_kb + peak[$pid]))
 done
 
 per_window_kb=$((total_kb / N))
 
-echo "windows:        $N"
-echo "total RSS:      ${total_kb} KB ($((total_kb / 1024)) MB)"
-echo "per-window:     ${per_window_kb} KB ($((per_window_kb / 1024)) MB)"
+echo ""
+echo "mode:           $MODE"
+echo "instances:      $N"
+echo "total peak RSS: ${total_kb} KB ($((total_kb / 1024)) MB)"
+echo "per-instance:   ${per_window_kb} KB ($((per_window_kb / 1024)) MB)"
 echo "budget (total): ${BUDGET_KB} KB ($((BUDGET_KB / 1024)) MB)"
-
-# Cleanup (force kill so a blocked reader cannot linger).
-kill -KILL "${pids[@]}" 2>/dev/null
-exec 3>&-
-rm -f "$fifo"
+echo ""
 
 if (( total_kb <= BUDGET_KB )); then
   echo "RESULT: PASS — within budget"

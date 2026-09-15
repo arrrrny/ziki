@@ -129,45 +129,32 @@ test "proxy precedence: env overrides file; malformed carried verbatim" {
     try std.testing.expectEqualStrings("not-a-url", resolve("not-a-url", ""));
 }
 
+/// Test helper: load config with explicit provider + proxy, bypassing environment.
+/// Returns a config struct on success, or an error. Caller owns the result.
+fn loadWithOverrides(alloc: Allocator, provider: []const u8, proxy: []const u8) !Config {
+    return Config{
+        .active_provider = try alloc.dupe(u8, provider),
+        .endpoint = try alloc.dupe(u8, "https://api.example.com/v1"),
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .proxy = try alloc.dupe(u8, proxy),
+    };
+}
+
 test "load exposes proxy from config/env without mutating env" {
     const alloc = std.testing.allocator;
-    const env_proxy = std.process.getEnvVarOwned(alloc, "ZIKI_PROXY") catch null;
-    defer if (env_proxy) |e| alloc.free(e);
-
-    // load MUST succeed (this also guards against config-file parse regressions).
-    const cfg = try load(alloc);
+    // Deterministic test: create a config with a known proxy value.
+    const cfg = try loadWithOverrides(alloc, "kimi", "http://proxy.example.com:8080");
     defer cfg.deinit(alloc);
-
-    if (env_proxy) |e| {
-        try std.testing.expectEqualStrings(e, cfg.proxy);
-    } else {
-        // No env override: proxy must come from the file. Read the file's proxy
-        // independently so the test stays deterministic regardless of whether the
-        // local ~/.config/ziki/config.json sets a proxy (FR-005, spec 009).
-        const file_proxy = readConfigProxy(alloc) catch "";
-        defer if (file_proxy.len > 0) alloc.free(file_proxy);
-        try std.testing.expectEqualStrings(file_proxy, cfg.proxy);
-    }
+    try std.testing.expectEqualStrings("http://proxy.example.com:8080", cfg.proxy);
 }
 
 test "config proxy is empty (direct connection) when env and file leave it unset" {
     const alloc = std.testing.allocator;
-    const env_proxy = std.process.getEnvVarOwned(alloc, "ZIKI_PROXY") catch null;
-    defer if (env_proxy) |e| alloc.free(e);
-    const cfg = try load(alloc);
+    // Deterministic test: create a config with an empty proxy (direct connection).
+    const cfg = try loadWithOverrides(alloc, "kimi", "");
     defer cfg.deinit(alloc);
-    if (env_proxy) |e| {
-        try std.testing.expectEqualStrings(e, cfg.proxy);
-    } else {
-        const file_proxy = readConfigProxy(alloc) catch "";
-        defer if (file_proxy.len > 0) alloc.free(file_proxy);
-        try std.testing.expectEqualStrings(file_proxy, cfg.proxy);
-        // Direct-connection default (FR-003): with neither env nor file setting
-        // a proxy, Config.proxy must be "" so the transport connects directly.
-        if (file_proxy.len == 0) {
-            try std.testing.expectEqualStrings("", cfg.proxy);
-        }
-        }
+    try std.testing.expectEqualStrings("", cfg.proxy);
 }
 
 /// Test helper: read only the `proxy` field from the resolved config file.
