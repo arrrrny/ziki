@@ -45,8 +45,12 @@ pub const OpenAIProvider = struct {
         var n: usize = 0;
         headers[n] = .{ .name = "content-type", .value = "application/json" };
         n += 1;
+        var auth: []const u8 = "";
         if (self.api_key.len > 0) {
-            const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{self.api_key});
+            auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{self.api_key});
+        }
+        defer if (auth.len > 0) alloc.free(auth);
+        if (auth.len > 0) {
             headers[n] = .{ .name = "authorization", .value = auth };
             n += 1;
         }

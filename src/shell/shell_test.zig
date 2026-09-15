@@ -118,8 +118,8 @@ test "non-slash line routes to handler registered under empty key" {
 const Capture = struct {
     alloc: Allocator,
     buf: std.ArrayList(u8),
-    fn init(a: Allocator) Capture {
-        return .{ .alloc = a, .buf = std.ArrayList(u8).initCapacity(a, 0) };
+    fn init(a: Allocator) !Capture {
+        return .{ .alloc = a, .buf = try std.ArrayList(u8).initCapacity(a, 0) };
     }
     fn writeFn(ctx_: *anyopaque, data: []const u8) void {
         const self: *Capture = @ptrCast(@alignCast(ctx_));
@@ -133,7 +133,7 @@ test "repl processes scripted input in order, skips empty, stops on EOF" {
     const input = "/help\n\n/provider kimi\n/stop\n";
     var stream = std.io.fixedBufferStream(@as([]const u8, input));
     const reader = stream.reader();
-    var cap = Capture.init(a);
+    var cap = try Capture.init(a);
     defer cap.buf.deinit(a);
     const out = Output{ .ctx = &cap, .vtable = &capture_vtable };
 
