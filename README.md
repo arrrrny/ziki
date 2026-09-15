@@ -106,9 +106,17 @@ doesn't ship.
 
 ```bash
 zig build
-zig build test      # 65 tests. all green. no exceptions.
+zig build test      # all green. no exceptions.
 ./zig-out/bin/ziki /goal "your objective" --provider cliproxy
+./zig-out/bin/ziki resume [goal-id]   # continue a persisted goal from the store
 ```
+
+A goal run can be interrupted (Ctrl-C, `/stop`, SIGTERM, crash) and continued
+later with `resume`: the goal state and conversation transcript are persisted
+after every turn. The loop enforces budgets (`--timeout`/`--no-timeout`,
+`--max-tokens`, `--max-turns`), compacts the conversation when the token budget
+is exceeded, and aborts mid-turn — including during provider I/O and
+long-running Bash commands.
 
 Config lives at `~/.config/ziki/config.json`:
 

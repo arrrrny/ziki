@@ -105,3 +105,51 @@ test "FlakyProvider fails first N then succeeds" {
     defer std.testing.allocator.free(r.message.content);
     try std.testing.expectEqualStrings("ok", r.message.content);
 }
+
+/// Provider that records the message list of every request (role/content
+/// lines) so tests can assert what the executor actually sent (spec 013 B6).
+pub const RecordingProvider = struct {
+    alloc: Allocator,
+    response: provider.ChatResponse,
+    calls: usize = 0,
+    log: std.ArrayList(u8),
+
+    pub fn init(alloc: Allocator, response: provider.ChatResponse) RecordingProvider {
+        return .{ .alloc = alloc, .response = response, .log = std.ArrayList(u8).initCapacity(alloc, 0) catch unreachable };
+    }
+    pub fn deinit(self: *RecordingProvider) void {
+        self.log.deinit(self.alloc);
+    }
+    pub fn toProvider(self: *RecordingProvider) provider.Provider {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+
+    fn name(_: *anyopaque) []const u8 {
+        return "recording";
+    }
+    fn complete(ctx: *anyopaque, alloc: Allocator, req: provider.CompletionRequest) !provider.ChatResponse {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        for (req.messages) |m| {
+            try self.log.appendSlice(self.alloc, m.role.jsonString());
+            try self.log.appendSlice(self.alloc, ":");
+            try self.log.appendSlice(self.alloc, m.content);
+            try self.log.appendSlice(self.alloc, "\n");
+        }
+        try self.log.appendSlice(self.alloc, "---\n");
+        return try clone(alloc, self.response);
+    }
+};
+
+test "RecordingProvider captures request contents" {
+    const rs = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "ok" } };
+    var rp = RecordingProvider.init(std.testing.allocator, rs);
+    defer rp.deinit();
+    const p = rp.toProvider();
+    const msgs = [_]provider.ChatMessage{.{ .role = .user, .content = "seeded turn" }};
+    const r = try p.complete(std.testing.allocator, .{ .messages = &msgs, .tools = &[0]provider.ToolSpec{} });
+    defer std.testing.allocator.free(r.message.content);
+    try std.testing.expect(std.mem.indexOf(u8, rp.log.items, "user:seeded turn\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), rp.calls);
+}

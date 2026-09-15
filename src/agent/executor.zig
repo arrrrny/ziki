@@ -1464,3 +1464,138 @@ test "executor persists the transcript after each turn (B5)" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expectEqualStrings("Goal: create hello.txt", loaded[1].content);
 }
+
+test "seeded history is sent verbatim on resume (B6)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const ok = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "resumed and done" } };
+    var rp = fake13.RecordingProvider.init(alloc, ok);
+    defer rp.deinit();
+    const tools = [_]Tool{};
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = rp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try Goal.init(alloc, "create hello.txt", null, "sess1");
+    defer goal.deinit(alloc);
+    goal.used.turns = 3; // carried from the earlier run
+    goal.used.tokens = 250;
+
+    const history = [_]provider.ChatMessage{
+        .{ .role = .system, .content = "You are an autonomous coding agent." },
+        .{ .role = .user, .content = "Goal: create hello.txt" },
+        .{ .role = .assistant, .content = "", .tool_calls = &[_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"hello.txt\",\"data\":\"hi\"}" }} },
+        .{ .role = .tool, .content = "exit=0\nhi", .tool_call_id = "c1" },
+    };
+    try ex.runWithHistory(&goal, &history);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .completed);
+    // The request replayed the persisted turns verbatim (SC-001).
+    try std.testing.expect(std.mem.indexOf(u8, rp.log.items, "user:Goal: create hello.txt\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rp.log.items, "tool:exit=0\nhi\n") != null);
+    // Usage counters carried over rather than resetting.
+    try std.testing.expect(goal.used.turns == 4);
+    try std.testing.expect(goal.used.tokens > 250);
+}
+
+test "resume round-trip through the store continues an interrupted goal (B18)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+    const wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    var wt_impl_mut = wt_impl;
+    const wt = wt_impl_mut.toTool();
+    const tools = [_]Tool{wt};
+
+    // --- Run 1: interrupted after one turn (provider dies on the next turn).
+    {
+        const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"hello.txt\",\"data\":\"hi\"}" }};
+        const responses = [_]provider.ChatResponse{
+            .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 60, .completion_tokens = 5 } },
+        };
+        var fp = fake13.FakeProvider.init(&responses);
+        // Wrap: first call ok, later calls fail (simulating a crash mid-run).
+        const OneShotThenFail = struct {
+            fp: *fake13.FakeProvider,
+            calls: usize = 0,
+            fn toProvider(self: *@This()) provider.Provider {
+                return .{ .ctx = self, .vtable = &vtable };
+            }
+            const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+            fn name(_: *anyopaque) []const u8 {
+                return "one_shot_then_fail";
+            }
+            fn complete(ctx: *anyopaque, pa: Allocator, req: provider.CompletionRequest) anyerror!provider.ChatResponse {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.calls += 1;
+                if (self.calls > 1) return error.ProviderError;
+                return self.fp.toProvider().complete(pa, req);
+            }
+        };
+        var otf = OneShotThenFail{ .fp = &fp };
+        var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+        const repo = repo_impl.toRepository();
+        var ex = GoalExecutor{
+            .alloc = alloc,
+            .provider = otf.toProvider(),
+            .tools = &tools,
+            .repo = repo,
+            .fs = fake.toFs(),
+            .dir = ".ziki",
+            .session_id = "sess1",
+        };
+        var goal = try Goal.init(alloc, "create hello.txt containing hi", null, "sess1");
+        defer goal.deinit(alloc);
+        goal.budgets.max_turns = 5;
+        try std.testing.expectError(error.ProviderError, ex.run(&goal));
+        _ = ex.report.?.len; // report exists; goal state must be persisted
+        if (ex.report) |r| alloc.free(r);
+
+        // Goal + transcript are in the store; status still active. The store
+        // holds the last persisted state (end of turn 1; the failed turn's
+        // in-memory increment was never saved).
+        var reloaded = (try repo.load(alloc)).?;
+        defer reloaded.deinit(alloc);
+        try std.testing.expect(reloaded.status == .active);
+        try std.testing.expectEqual(@as(u32, 1), reloaded.used.turns);
+        const stored = try repo.loadHistory(alloc, reloaded.id);
+        try std.testing.expect(stored != null);
+        try std.testing.expect(stored.?.len >= 4); // system, goal, assistant tool_call, tool result
+
+        // --- Run 2: resume with a fresh executor seeded from the store.
+        const ok = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "done" } };
+        var rp = fake13.RecordingProvider.init(alloc, ok);
+        defer rp.deinit();
+        var repo2_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+        const repo2 = repo2_impl.toRepository();
+        var ex2 = GoalExecutor{
+            .alloc = alloc,
+            .provider = rp.toProvider(),
+            .tools = &tools,
+            .repo = repo2,
+            .fs = fake.toFs(),
+            .dir = ".ziki",
+            .session_id = "sess1",
+        };
+        try ex2.runWithHistory(&reloaded, stored.?);
+        defer if (ex2.report) |r| alloc.free(r);
+        defer S13Repo.freeHistory(alloc, stored.?);
+
+        try std.testing.expect(reloaded.status == .completed);
+        // The resume request replayed the persisted turns (SC-001).
+        try std.testing.expect(std.mem.indexOf(u8, rp.log.items, "tool:wrote hello.txt\n") != null);
+        // Transcript cleared at terminal so the next goal starts clean.
+        try std.testing.expect((try repo2.loadHistory(alloc, reloaded.id)) == null);
+    }
+}

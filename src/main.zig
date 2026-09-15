@@ -14,6 +14,8 @@ const FakeTransport = @import("provider/transport.zig").FakeTransport;
 const Goal = @import("goal/goal.zig").Goal;
 const Status = @import("goal/goal.zig").Status;
 const FsGoalRepository = @import("goal/repository.zig").FsGoalRepository;
+const repository = @import("goal/repository.zig");
+const stopmod = @import("agent/stop.zig");
 const Tool = @import("tool/tool.zig").Tool;
 const ReadTool = @import("tool/read.zig").ReadTool;
 const EditTool = @import("tool/edit.zig").EditTool;
@@ -52,6 +54,53 @@ fn emitSummary(goal: *const Goal) !void {
     try emit("  objective: {s}", .{goal.objective});
     try emit("  status:    {s}", .{goal.status.jsonString()});
     try emit("  progress:  {s}", .{goal.progress});
+}
+
+// ---------------------------------------------------------------------------
+// Goal-run signal handling (spec 013 T13): SIGINT/SIGTERM during a goal run
+// write the stop file so the loop aborts gracefully and saves state instead
+// of dying mid-turn. The handler is async-signal-safe (open/write/close only)
+// and no-ops when no goal run is active.
+// ---------------------------------------------------------------------------
+var g_goal_stop_path: [512]u8 = undefined;
+var g_goal_stop_len: usize = 0;
+var g_goal_active = std.atomic.Value(bool).init(false);
+
+fn goalSignalHandler(sig: i32) callconv(.c) void {
+    _ = sig;
+    if (!g_goal_active.load(.acquire)) return;
+    if (g_goal_stop_len == 0) return;
+    const fd = std.posix.open(g_goal_stop_path[0..g_goal_stop_len], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return;
+    std.posix.close(fd);
+}
+
+fn armGoalSignals(stop_path: []const u8) void {
+    if (stop_path.len > g_goal_stop_path.len) return;
+    @memcpy(g_goal_stop_path[0..stop_path.len], stop_path);
+    g_goal_stop_len = stop_path.len;
+    g_goal_active.store(true, .release);
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = goalSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
+fn disarmGoalSignals() void {
+    g_goal_active.store(false, .release);
+}
+
+/// Classification of a resume request (spec 013 T12/B17). Pure so the guards
+/// are testable without a live store.
+pub const ResumeGuard = enum { ok, no_such_goal, terminal };
+pub fn resumeGuard(want_id: ?[]const u8, stored_id: []const u8, status: Status) ResumeGuard {
+    if (want_id) |w| {
+        if (!std.mem.eql(u8, w, stored_id)) return .no_such_goal;
+    }
+    if (status.isTerminal()) return .terminal;
+    return .ok;
 }
 
 fn sessionProviderPath(alloc: Allocator, state_dir: []const u8) ![]u8 {
@@ -131,6 +180,8 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     var timeout_seconds: u64 = 600;
     var no_timeout_flag = false;
     var clean_tree = true;
+    var max_tokens: ?u64 = null;
+    var max_turns: ?u32 = null;
 
     var i: usize = 1;
     while (i < tokens.len) : (i += 1) {
@@ -176,6 +227,36 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
             no_timeout_flag = true;
         } else if (std.mem.eql(u8, t, "--no-clean")) {
             clean_tree = false;
+        } else if (std.mem.eql(u8, t, "--max-tokens")) {
+            if (i + 1 >= tokens.len) {
+                try emitErr("missing value for --max-tokens");
+                return;
+            }
+            max_tokens = std.fmt.parseUnsigned(u64, tokens[i + 1], 10) catch {
+                try emitErr("invalid --max-tokens value");
+                return;
+            };
+            i += 1;
+        } else if (std.mem.startsWith(u8, t, "--max-tokens=")) {
+            max_tokens = std.fmt.parseUnsigned(u64, t["--max-tokens=".len..], 10) catch {
+                try emitErr("invalid --max-tokens value");
+                return;
+            };
+        } else if (std.mem.eql(u8, t, "--max-turns")) {
+            if (i + 1 >= tokens.len) {
+                try emitErr("missing value for --max-turns");
+                return;
+            }
+            max_turns = std.fmt.parseUnsigned(u32, tokens[i + 1], 10) catch {
+                try emitErr("invalid --max-turns value");
+                return;
+            };
+            i += 1;
+        } else if (std.mem.startsWith(u8, t, "--max-turns=")) {
+            max_turns = std.fmt.parseUnsigned(u32, t["--max-turns=".len..], 10) catch {
+                try emitErr("invalid --max-turns value");
+                return;
+            };
         } else {
             try objective_parts.append(alloc, t);
         }
@@ -221,7 +302,6 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     const write_t = wt.toTool();
     var bt = BashTool.init(fs_iface, allow_push, if (no_timeout_flag) BashTool.no_timeout else timeout_seconds);
     const bash_t = bt.toTool();
-
     // Skills (FR-005, FR-006, FR-010): the skill tool and the system-prompt
     // section exist only when at least one skill was discovered — with zero
     // skills the goal path behaves exactly as before this feature.
@@ -240,6 +320,16 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
 
     var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
     const repo = repo_impl.toRepository();
+    // Fresh goal start: drop any transcript left by an earlier goal in this
+    // session so a later resume never replays a foreign conversation (FR-003).
+    repo.clearHistory(alloc) catch {};
+
+    // Mid-turn stop observation (spec 013): the file probe backs both the
+    // executor and the Bash tool so `/stop`, SIGINT and SIGTERM all land.
+    const stop_probe_path = try std.fmt.allocPrint(alloc, "{s}/stop." ++ SESSION_ID, .{state_dir});
+    defer alloc.free(stop_probe_path);
+    var probe_impl = stopmod.FsProbe.init(fs_iface, stop_probe_path);
+    bt.stop = probe_impl.probe();
 
     var ex = GoalExecutor{
         .alloc = alloc,
@@ -252,6 +342,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         .verbose = verbose,
         .skills_listing = skills_listing,
         .clean_tree = clean_tree,
+        .stop = probe_impl.probe(),
     };
     // FR-006: the job report is allocated inside the run (finalizeReport). Free it
     // on every exit path, including when ex.run() throws (the explicit free below
@@ -260,6 +351,12 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
 
     var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
     defer goal.deinit(alloc);
+    // Budgets (spec 013 FR-010): --timeout/--no-timeout set the goal's
+    // wall-clock budget (matching the Bash per-command budget); --max-tokens
+    // and --max-turns override the remaining caps.
+    goal.budgets.max_seconds = if (no_timeout_flag) std.math.maxInt(u64) else timeout_seconds;
+    if (max_tokens) |v| goal.budgets.max_tokens = v;
+    if (max_turns) |v| goal.budgets.max_turns = v;
 
     // Spec 011: wire the Herdr state publisher. `buildStatePublisher` reads
     // HERDR_PANE_ID and builds a real reporter when present, or a null-reporter
@@ -269,6 +366,9 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), std.posix.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, stdout_writer);
 
     try emitStatus(.active);
+    // Ctrl-C / SIGTERM during a goal run abort gracefully via the stop file.
+    armGoalSignals(stop_probe_path);
+    defer disarmGoalSignals();
     try ex.run(&goal);
     try emitStatus(goal.status);
     try emitSummary(&goal);
@@ -295,6 +395,190 @@ fn runStop(alloc: Allocator, state_dir: []const u8) !void {
         return;
     };
     try emit("stop signal set; the active goal will abort on its next turn", .{});
+}
+
+/// `/resume [goal-id] [--provider <name>] [-v] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]`
+/// (spec 013 T12): load the persisted goal + transcript from the store and
+/// continue the loop where it stopped.
+fn runResume(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs, registry: *const skill_registry.SkillRegistry) !void {
+    var goal_id_arg: ?[]const u8 = null;
+    var provider_override: ?[]const u8 = null;
+    var verbose = false;
+    var allow_push = false;
+    var timeout_seconds: u64 = 600;
+    var no_timeout_flag = false;
+    var clean_tree = true;
+
+    var i: usize = 1;
+    while (i < tokens.len) : (i += 1) {
+        const t = tokens[i];
+        if (std.mem.eql(u8, t, "--provider")) {
+            if (i + 1 >= tokens.len) {
+                try emitErr("missing value for --provider");
+                return;
+            }
+            provider_override = tokens[i + 1];
+            i += 1;
+        } else if (std.mem.startsWith(u8, t, "--provider=")) {
+            provider_override = t["--provider=".len..];
+        } else if (std.mem.eql(u8, t, "--verbose") or std.mem.eql(u8, t, "-v")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, t, "--allow-push")) {
+            allow_push = true;
+        } else if (std.mem.eql(u8, t, "--timeout")) {
+            if (i + 1 >= tokens.len) {
+                try emitErr("missing value for --timeout");
+                return;
+            }
+            timeout_seconds = std.fmt.parseUnsigned(u64, tokens[i + 1], 10) catch {
+                try emitErr("invalid --timeout value");
+                return;
+            };
+            i += 1;
+        } else if (std.mem.startsWith(u8, t, "--timeout=")) {
+            timeout_seconds = std.fmt.parseUnsigned(u64, t["--timeout=".len..], 10) catch {
+                try emitErr("invalid --timeout value");
+                return;
+            };
+        } else if (std.mem.eql(u8, t, "--no-timeout")) {
+            no_timeout_flag = true;
+        } else if (std.mem.eql(u8, t, "--no-clean")) {
+            clean_tree = false;
+        } else {
+            if (goal_id_arg != null) {
+                try emitErr("resume takes at most one goal id");
+                return;
+            }
+            goal_id_arg = t;
+        }
+    }
+
+    // Load the persisted goal and apply the resume guards (B17).
+    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
+    const repo = repo_impl.toRepository();
+    var goal = (repo.load(alloc) catch null) orelse {
+        try emitErr("no goal to resume — start one with /goal");
+        return;
+    };
+    defer goal.deinit(alloc);
+    switch (resumeGuard(goal_id_arg, goal.id, goal.status)) {
+        .no_such_goal => {
+            const msg = try std.fmt.allocPrint(alloc, "no such goal in the store: {s}", .{goal_id_arg.?});
+            defer alloc.free(msg);
+            try emitErr(msg);
+            return;
+        },
+        .terminal => {
+            const msg = try std.fmt.allocPrint(alloc, "goal already {s} — nothing to resume", .{goal.status.jsonString()});
+            defer alloc.free(msg);
+            try emitErr(msg);
+            return;
+        },
+        .ok => {},
+    }
+
+    // Provider selection mirrors /goal.
+    const cfg = config.load(alloc) catch {
+        try emitErr("no provider configured — set one via /provider or config");
+        return;
+    };
+    defer cfg.deinit(alloc);
+    const session_prov = readSessionProvider(alloc, state_dir) catch null;
+    defer if (session_prov) |sp| alloc.free(sp);
+    const effective = provider_override orelse (session_prov orelse cfg.active_provider);
+    if (presets.findPreset(effective) == null) {
+        try emitErr("unknown provider — must be one of the six required providers");
+        return;
+    }
+
+    var transport = HttpTransport.init(alloc, if (cfg.proxy.len > 0) cfg.proxy else null) catch {
+        try emitErr("invalid proxy URL in configuration");
+        return;
+    };
+    defer transport.deinit();
+    var prov_impl = presets.build(alloc, effective, cfg.endpoint, cfg.model, cfg.api_key, transport.toTransport()) catch {
+        try emitErr("could not build provider");
+        return;
+    };
+    const prov = prov_impl.toProvider();
+
+    var rt = ReadTool.init(fs_iface);
+    const read_t = rt.toTool();
+    var et = EditTool.init(fs_iface);
+    const edit_t = et.toTool();
+    var sct = SearchTool.init(fs_iface);
+    const search_t = sct.toTool();
+    var wt = WriteTool.init(fs_iface);
+    const write_t = wt.toTool();
+    var bt = BashTool.init(fs_iface, allow_push, if (no_timeout_flag) BashTool.no_timeout else timeout_seconds);
+    const bash_t = bt.toTool();
+
+    var st = SkillTool.init(registry);
+    const skill_t = st.toTool();
+    var tools_storage: [6]Tool = .{ read_t, edit_t, search_t, write_t, bash_t, undefined };
+    var tools_len: usize = 5;
+    var skills_listing: ?[]const u8 = null;
+    defer if (skills_listing) |sl| alloc.free(sl);
+    if (registry.list().len > 0) {
+        tools_storage[5] = skill_t;
+        tools_len = 6;
+        skills_listing = skill_registry.listingText(alloc, registry) catch null;
+    }
+    const tools = tools_storage[0..tools_len];
+
+    // Load the persisted transcript (missing/corrupt/foreign → fresh talk).
+    const history: []const @import("provider/provider.zig").ChatMessage = repo.loadHistory(alloc, goal.id) catch null orelse &[_]@import("provider/provider.zig").ChatMessage{};
+    defer if (history.len > 0) repository.freeHistory(alloc, @constCast(history));
+
+    // Mid-turn stop observation (spec 013): same wiring as /goal.
+    const stop_probe_path = try std.fmt.allocPrint(alloc, "{s}/stop." ++ SESSION_ID, .{state_dir});
+    defer alloc.free(stop_probe_path);
+    var probe_impl = stopmod.FsProbe.init(fs_iface, stop_probe_path);
+    bt.stop = probe_impl.probe();
+
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = prov,
+        .tools = tools,
+        .repo = repo,
+        .fs = fs_iface,
+        .dir = state_dir,
+        .session_id = SESSION_ID,
+        .verbose = verbose,
+        .skills_listing = skills_listing,
+        .clean_tree = clean_tree,
+        .stop = probe_impl.probe(),
+    };
+    defer if (ex.report) |r| alloc.free(r);
+
+    // Time budget on resume: the persisted counter is the carry; a re-specified
+    // --timeout widens/tightens the total wall clock from here on.
+    goal.budgets.max_seconds = if (no_timeout_flag) std.math.maxInt(u64) else timeout_seconds;
+    goal.status = .active;
+    alloc.free(goal.progress);
+    goal.progress = try alloc.dupe(u8, "resumed");
+    goal.updated_at = std.time.timestamp();
+
+    try emit("resuming goal {s}: {s}", .{ goal.id, goal.objective });
+    try emit("  turns: {d}/{d}  tokens: {d}  elapsed: {d}s", .{ goal.used.turns, goal.budgets.max_turns, goal.used.tokens, goal.used.seconds });
+    try emitStatus(.active);
+    armGoalSignals(stop_probe_path);
+    defer disarmGoalSignals();
+    try ex.runWithHistory(&goal, history);
+    try emitStatus(goal.status);
+    try emitSummary(&goal);
+
+    if (ex.report) |r| {
+        try emit("job report:", .{});
+        try emit("{s}", .{r});
+    }
+    const push_line = if (bt.push_occurred)
+        "push: occurred"
+    else if (bt.push_blocked)
+        "push: blocked (not authorized — re-run with --allow-push)"
+    else
+        "push: not requested";
+    try emit("  {s}", .{push_line});
 }
 
 fn runStatus(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
@@ -347,6 +631,7 @@ fn runProvider(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8) !v
 
 const GoalCtx = struct { state_dir: []const u8, fs: Fs, registry: *const skill_registry.SkillRegistry };
 const StopCtx = struct { state_dir: []const u8 };
+const ResumeCtx = struct { state_dir: []const u8, fs: Fs, registry: *const skill_registry.SkillRegistry };
 const ProviderCtx = struct { state_dir: []const u8 };
 const StatusCtx = struct { state_dir: []const u8, fs: Fs };
 const GoalsCtx = struct { state_dir: []const u8, fs: Fs };
@@ -367,6 +652,16 @@ fn stopHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     const self: *StopCtx = @ptrCast(@alignCast(ctx_));
     _ = intent;
     runStop(alloc, self.state_dir) catch {};
+    return Result{ .output = try alloc.dupe(u8, "") };
+}
+fn resumeHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
+    const self: *ResumeCtx = @ptrCast(@alignCast(ctx_));
+    var toks = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+    defer toks.deinit(alloc);
+    try toks.append(alloc, "/resume");
+    var it = std.mem.tokenizeScalar(u8, intent.args, ' ');
+    while (it.next()) |t| try toks.append(alloc, t);
+    runResume(alloc, toks.items, self.state_dir, self.fs, self.registry) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
 fn providerHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
@@ -405,7 +700,8 @@ fn skillHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
 }
 fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
     try emit("commands:", .{});
-    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
+    try emit("  /goal <objective> [--criterion \"...\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--max-tokens <n>] [--max-turns <n>] [--no-clean]", .{});
+    try emit("  /resume [goal-id] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
     try emit("  /stop", .{});
     try emit("  /status", .{});
     try emit("  /goals", .{});
@@ -417,6 +713,7 @@ fn helpHandle(_: *anyopaque, _: Allocator, _: Intent) !Result {
 
 const goal_vtable = Handler.VTable{ .handle = goalHandle };
 const stop_vtable = Handler.VTable{ .handle = stopHandle };
+const resume_vtable = Handler.VTable{ .handle = resumeHandle };
 const provider_vtable = Handler.VTable{ .handle = providerHandle };
 const status_vtable = Handler.VTable{ .handle = statusHandle };
 const goals_vtable = Handler.VTable{ .handle = goalsHandle };
@@ -443,7 +740,8 @@ fn runRepl(alloc: Allocator, dispatcher: *Dispatcher) !void {
 
 fn usage() !void {
     try emit("usage:", .{});
-    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
+    try emit("  ziki /goal \"<objective>\" [--criterion \"<text>\"] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--max-tokens <n>] [--max-turns <n>] [--no-clean]", .{});
+    try emit("  ziki resume [goal-id] [--provider <name>] [--verbose] [--allow-push] [--timeout <s>|--no-timeout] [--no-clean]", .{});
     try emit("  ziki /status", .{});
     try emit("  ziki /stop", .{});
     try emit("  ziki /goals", .{});
@@ -485,6 +783,7 @@ pub fn main() !void {
     // Composition root: build the dispatcher and inject the handlers.
     var gh = GoalCtx{ .state_dir = state_dir, .fs = fs_iface, .registry = &skill_reg };
     var sh = StopCtx{ .state_dir = state_dir };
+    var rh = ResumeCtx{ .state_dir = state_dir, .fs = fs_iface, .registry = &skill_reg };
     var ph = ProviderCtx{ .state_dir = state_dir };
     var st = StatusCtx{ .state_dir = state_dir, .fs = fs_iface };
     var gl = GoalsCtx{ .state_dir = state_dir, .fs = fs_iface };
@@ -495,6 +794,7 @@ pub fn main() !void {
     defer dispatcher.deinit();
     try dispatcher.register("goal", .{ .ctx = &gh, .vtable = &goal_vtable });
     try dispatcher.register("stop", .{ .ctx = &sh, .vtable = &stop_vtable });
+    try dispatcher.register("resume", .{ .ctx = &rh, .vtable = &resume_vtable });
     try dispatcher.register("provider", .{ .ctx = &ph, .vtable = &provider_vtable });
     try dispatcher.register("status", .{ .ctx = &st, .vtable = &status_vtable });
     try dispatcher.register("goals", .{ .ctx = &gl, .vtable = &goals_vtable });
@@ -506,7 +806,24 @@ pub fn main() !void {
         return;
     }
     if (!std.mem.startsWith(u8, args[1], "/")) {
-        try usage();
+        // Bare `ziki resume [goal-id]` (spec 013 FR-001); anything else is usage.
+        if (!std.mem.eql(u8, args[1], "resume")) {
+            try usage();
+            return;
+        }
+        const joined = try std.mem.join(alloc, " ", args[1..]);
+        defer alloc.free(joined);
+        const with_slash = try std.fmt.allocPrint(alloc, "/{s}", .{joined});
+        defer alloc.free(with_slash);
+        const intent = (try parser.parseLine(with_slash)) orelse {
+            try emitErr("empty command");
+            return;
+        };
+        const result = dispatcher.dispatch(alloc, intent) catch |e| Result{
+            .output = try std.fmt.allocPrint(alloc, "error: {s}", .{@errorName(e)}),
+        };
+        if (result.output.len > 0) try emit("{s}", .{result.output});
+        alloc.free(result.output);
         return;
     }
     const line = try std.mem.join(alloc, " ", args[1..]);
@@ -547,3 +864,14 @@ test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null other
     without.publish(.working, null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..fbs2.pos], "[ziki-state: working]") != null);
 }
+
+test "resume guard classifications (B17)" {
+    try std.testing.expect(resumeGuard(null, "goal-1", .active) == .ok);
+    try std.testing.expect(resumeGuard("goal-1", "goal-1", .active) == .ok);
+    try std.testing.expect(resumeGuard("goal-x", "goal-1", .active) == .no_such_goal);
+    try std.testing.expect(resumeGuard(null, "goal-1", .completed) == .terminal);
+    try std.testing.expect(resumeGuard(null, "goal-1", .blocked) == .terminal);
+    try std.testing.expect(resumeGuard(null, "goal-1", .aborted) == .terminal);
+}
+
+    
