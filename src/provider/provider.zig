@@ -53,10 +53,24 @@ pub const FinishReason = enum {
     }
 };
 
+/// Token usage reported by the provider for one completion (spec 013 D2).
+/// When the backend reports nothing, the executor estimates from message size.
+pub const TokenUsage = struct {
+    prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
+
+    pub fn total(self: TokenUsage) u64 {
+        return self.prompt_tokens + self.completion_tokens;
+    }
+};
+
 /// The model's reply for one turn.
 pub const ChatResponse = struct {
     message: ChatMessage,
     finish_reason: FinishReason = .stop,
+    /// Provider-reported usage, when the backend supplies it. Null means the
+    /// caller must estimate (see executor token accounting).
+    usage: ?TokenUsage = null,
 };
 
 /// A tool's schema exposed to the model.

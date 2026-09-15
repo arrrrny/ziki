@@ -150,10 +150,55 @@ fn parseResponse(alloc: Allocator, body: []const u8) !provider.ChatResponse {
         if (fr_v == .string) finish_reason = provider.FinishReason.fromJson(fr_v.string);
     }
 
+    // Token usage (spec 013): top-level `usage` object when the backend
+    // reports it; omitted/absent usage stays null so the executor estimates.
+    var usage: ?provider.TokenUsage = null;
+    if (root.value.object.get("usage")) |uv| {
+        if (uv == .object) {
+            const pt: u64 = if (uv.object.get("prompt_tokens")) |v|
+                (if (v == .integer and v.integer >= 0) @intCast(v.integer) else 0)
+            else
+                0;
+            const ct: u64 = if (uv.object.get("completion_tokens")) |v|
+                (if (v == .integer and v.integer >= 0) @intCast(v.integer) else 0)
+            else
+                0;
+            usage = .{ .prompt_tokens = pt, .completion_tokens = ct };
+        }
+    }
+
     return provider.ChatResponse{
         .message = .{ .role = .assistant, .content = content, .tool_calls = tool_calls },
         .finish_reason = finish_reason,
+        .usage = usage,
     };
+}
+
+test "parseResponse maps token usage when present (B19)" {
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":"ok"}}],
+        \\"usage":{"prompt_tokens":120,"completion_tokens":34}}
+    ;
+    const r = try parseResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(r.message.content);
+    try std.testing.expect(r.usage != null);
+    try std.testing.expectEqual(@as(u64, 120), r.usage.?.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 34), r.usage.?.completion_tokens);
+    try std.testing.expectEqual(@as(u64, 154), r.usage.?.total());
+}
+
+test "parseResponse leaves usage null when the backend omits it (B19)" {
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":"hi"}}]}
+    ;
+    const r = try parseResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(r.message.content);
+    try std.testing.expect(r.usage == null);
+}
+
+test "ChatResponse.usage defaults to null (B19)" {
+    const r = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "" } };
+    try std.testing.expect(r.usage == null);
 }
 
 test "parseResponse maps tool_calls" {

@@ -48,6 +48,7 @@ fn clone(alloc: Allocator, r: provider.ChatResponse) !provider.ChatResponse {
             .tool_call_id = if (r.message.tool_call_id) |x| try alloc.dupe(u8, x) else null,
         },
         .finish_reason = r.finish_reason,
+        .usage = r.usage,
     };
 }
 
