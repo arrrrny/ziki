@@ -52,6 +52,7 @@ test "aggregator loads all modules" {
     _ = herdr;
     _ = main_mod;
     _ = config;
+    _ = shell_test;
     _ = skill;
     _ = skill_registry;
     _ = skill_tool;

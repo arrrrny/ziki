@@ -132,8 +132,10 @@ test "e2e: OpenAIProvider round-trips a request through FakeTransport" {
 // secrets stays green. Prints nothing about the key itself.
 test "e2e: live provider responds to a trivial completion (gated)" {
     const api_key = std.posix.getenv("ZIKI_API_KEY") orelse return error.SkipZigTest;
-    const endpoint = std.posix.getenv("ZIKI_ENDPOINT") orelse "https://api.kilo.ai/v1";
-    const model = std.posix.getenv("ZIKI_MODEL") orelse "kilo-1";
+    // The Kilo API is at /api/gateway, not /v1 — the /v1 path serves the
+    // marketing site and 404s. Override ZIKI_ENDPOINT for other providers.
+    const endpoint = std.posix.getenv("ZIKI_ENDPOINT") orelse "https://api.kilo.ai/api/gateway";
+    const model = std.posix.getenv("ZIKI_MODEL") orelse "nex-agi/nex-n2.5-pro:free";
     var real_t = try transport.HttpTransport.init(std.testing.allocator, null);
     defer real_t.deinit();
     const t = real_t.toTransport();
