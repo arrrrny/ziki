@@ -32,7 +32,9 @@ if [[ "$MODE" != "idle" && "$MODE" != "active-goal" ]]; then
   exit 1
 fi
 
-TMPDIR="$(mktemp -d)"
+# Private scratch dir under a non-canonical name: children must not inherit a
+# TMPDIR this script deletes on exit (canonical TMPDIR passes through untouched).
+HARNESS_TMP="$(mktemp -d)"
 pids=()
 fifo=""
 
@@ -44,13 +46,13 @@ cleanup() {
   if [[ -n "$fifo" && -e "$fifo" ]]; then
     rm -f "$fifo" 2>/dev/null || true
   fi
-  rm -rf "$TMPDIR" 2>/dev/null || true
+  rm -rf "$HARNESS_TMP" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 if [[ "$MODE" == "idle" ]]; then
   # Idle mode: FIFO held open keeps windows blocked reading stdin at steady state.
-  fifo="$(mktemp -u)"
+  fifo="$HARNESS_TMP/stdin-fifo"
   mkfifo "$fifo"
   exec 3<>"$fifo"
 
@@ -82,10 +84,10 @@ else
   echo "launching $N active-goal ziki instances from $BIN ..."
   declare -A peak
   for ((i = 0; i < N; i++)); do
-    state_dir="$TMPDIR/state-$i"
+    state_dir="$HARNESS_TMP/state-$i"
     mkdir -p "$state_dir"
 
-    input_fifo="$TMPDIR/input-$i"
+    input_fifo="$HARNESS_TMP/input-$i"
     mkfifo "$input_fifo"
 
     {
@@ -99,13 +101,20 @@ else
     peak[$pid]=0
   done
 
-  for ((s = 0; s < SAMPLE_S; s += 1)); do
+  # Sample until every window has exited: goals run to GOAL_TIMEOUT_S + 5, so a
+  # fixed SAMPLE_S window would miss the late RSS spikes the budget polices.
+  while :; do
     for pid in "${pids[@]}"; do
       rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
       if [[ -n "$rss" && "$rss" -gt "${peak[$pid]}" ]]; then
         peak[$pid]="$rss"
       fi
     done
+    alive=0
+    for pid in "${pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null && alive=1
+    done
+    (( alive )) || break
     sleep 1
   done
 

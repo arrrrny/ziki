@@ -15,7 +15,7 @@ pub const Preset = struct {
 
 pub const PRESETS = [_]Preset{
     .{ .name = "opencode", .default_endpoint = "http://localhost:4099/v1", .default_model = "opencode" },
-    .{ .name = "kilo", .default_endpoint = "https://api.kilo.ai/v1", .default_model = "kilo-1" },
+    .{ .name = "kilo", .default_endpoint = "https://api.kilo.ai/api/gateway", .default_model = "nex-agi/nex-n2.5-pro:free" },
     .{ .name = "zai", .default_endpoint = "https://api.z.ai/v1", .default_model = "glm-4.5-air" },
     .{ .name = "kimi", .default_endpoint = "https://api.moonshot.cn/v1", .default_model = "kimi-k2-0711" },
     .{ .name = "openai_custom", .default_endpoint = "https://api.openai.com/v1", .default_model = "gpt-4o-mini" },
@@ -52,6 +52,8 @@ pub fn build(
 
 test "presets cover exactly the five required providers" {
     try std.testing.expectEqual(@as(usize, 6), PRESETS.len);
+    // The Kilo API lives at /api/gateway; /v1 serves the marketing site and 404s.
+    try std.testing.expectEqualStrings("https://api.kilo.ai/api/gateway", findPreset("kilo").?.default_endpoint);
     try std.testing.expect(findPreset("kimi") != null);
     try std.testing.expect(findPreset("openai_custom") != null);
     try std.testing.expect(findPreset("anthropic") == null);

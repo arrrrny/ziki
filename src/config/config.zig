@@ -32,7 +32,16 @@ pub const Config = struct {
 pub fn load(alloc: Allocator) !Config {
     var env = std.process.getEnvMap(alloc) catch return error.ConfigError;
     defer env.deinit();
+    // A missing HOME just means "no config file" — loadFile tolerates an empty
+    // home (the fixture path won't exist), same as the old behavior.
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch "";
+    defer if (home.len > 0) alloc.free(home);
+    return loadFrom(alloc, home, &env);
+}
 
+/// Testable core of `load`: env vars win over `<home>/.config/ziki/config.json`,
+/// with the environment passed explicitly so tests never mutate the process env.
+pub fn loadFrom(alloc: Allocator, home: []const u8, env: *const std.process.EnvMap) !Config {
     var provider: []const u8 = "";
     var endpoint: []const u8 = "";
     var model: []const u8 = "";
@@ -46,7 +55,7 @@ pub fn load(alloc: Allocator) !Config {
     if (env.get("ZIKI_PROXY")) |v| proxy = v;
 
     // Config file overrides only when an env var is empty.
-    const ov = loadFile(alloc) catch FileOverrides{};
+    const ov = loadFile(alloc, home) catch FileOverrides{};
     defer {
         alloc.free(ov.provider);
         alloc.free(ov.endpoint);
@@ -82,9 +91,7 @@ const FileOverrides = struct {
     proxy: []const u8 = "",
 };
 
-fn loadFile(alloc: Allocator) !FileOverrides {
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return error.NoHome;
-    defer alloc.free(home);
+fn loadFile(alloc: Allocator, home: []const u8) !FileOverrides {
     const path = try std.fmt.allocPrint(alloc, "{s}/.config/ziki/config.json", .{home});
     defer alloc.free(path);
     const raw = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch return error.FileNotFound;
@@ -115,10 +122,15 @@ fn resolve(over: []const u8, under: []const u8) []const u8 {
 }
 
 test "load rejects unknown provider" {
-    // With no HOME/config and no env, load should fail with NoProviderConfigured
-    // (we cannot guarantee env in test, so just assert the function type-checks
-    // by checking findPreset behaviour already covered in presets tests).
-    _ = load;
+    const alloc = std.testing.allocator;
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("ZIKI_PROVIDER", "anthropic");
+    try std.testing.expectError(error.UnknownProvider, loadFrom(alloc, "", &env));
+
+    var empty = std.process.EnvMap.init(alloc);
+    defer empty.deinit();
+    try std.testing.expectError(error.NoProviderConfigured, loadFrom(alloc, "", &empty));
 }
 
 test "proxy precedence: env overrides file; malformed carried verbatim" {
@@ -129,46 +141,65 @@ test "proxy precedence: env overrides file; malformed carried verbatim" {
     try std.testing.expectEqualStrings("not-a-url", resolve("not-a-url", ""));
 }
 
-/// Test helper: load config with explicit provider + proxy, bypassing environment.
-/// Returns a config struct on success, or an error. Caller owns the result.
-fn loadWithOverrides(alloc: Allocator, provider: []const u8, proxy: []const u8) !Config {
-    return Config{
-        .active_provider = try alloc.dupe(u8, provider),
-        .endpoint = try alloc.dupe(u8, "https://api.example.com/v1"),
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .proxy = try alloc.dupe(u8, proxy),
-    };
-}
-
 test "load exposes proxy from config/env without mutating env" {
     const alloc = std.testing.allocator;
-    // Deterministic test: create a config with a known proxy value.
-    const cfg = try loadWithOverrides(alloc, "kimi", "http://proxy.example.com:8080");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("ZIKI_PROVIDER", "kimi");
+    try env.put("ZIKI_PROXY", "http://proxy.example.com:8080");
+
+    // Runs the real env/file resolution through loadFrom — a regression in
+    // load()'s proxy handling now fails here instead of passing green.
+    const cfg = try loadFrom(alloc, home, &env);
     defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("kimi", cfg.active_provider);
     try std.testing.expectEqualStrings("http://proxy.example.com:8080", cfg.proxy);
+}
+
+test "load falls back to the config file proxy when the env leaves it unset" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".config/ziki");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".config/ziki/config.json",
+        .data = "{\"active_provider\": \"kimi\", \"endpoint\": \"\", \"model\": \"\", \"api_key\": \"\", \"proxy\": \"http://file-proxy.example.com:3128\"}",
+    });
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("ZIKI_PROVIDER", "kimi");
+
+    const cfg = try loadFrom(alloc, home, &env);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("http://file-proxy.example.com:3128", cfg.proxy);
 }
 
 test "config proxy is empty (direct connection) when env and file leave it unset" {
     const alloc = std.testing.allocator;
-    // Deterministic test: create a config with an empty proxy (direct connection).
-    const cfg = try loadWithOverrides(alloc, "kimi", "");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".config/ziki");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".config/ziki/config.json",
+        .data = "{\"active_provider\": \"kimi\", \"endpoint\": \"\", \"model\": \"\", \"api_key\": \"\"}",
+    });
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("ZIKI_PROVIDER", "kimi");
+
+    const cfg = try loadFrom(alloc, home, &env);
     defer cfg.deinit(alloc);
     try std.testing.expectEqualStrings("", cfg.proxy);
 }
 
-/// Test helper: read only the `proxy` field from the resolved config file.
-/// Returns an empty slice when the file or field is absent.
-fn readConfigProxy(alloc: Allocator) ![]const u8 {
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return error.NoHome;
-    defer alloc.free(home);
-    const path = try std.fmt.allocPrint(alloc, "{s}/.config/ziki/config.json", .{home});
-    defer alloc.free(path);
-    const raw = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch return alloc.dupe(u8, "");
-    defer alloc.free(raw);
-    const Cfg = struct { proxy: ?[]const u8 = null };
-    var parsed = std.json.parseFromSlice(Cfg, alloc, raw, .{ .ignore_unknown_fields = true }) catch return alloc.dupe(u8, "");
-    defer parsed.deinit();
-    if (parsed.value.proxy) |p| return alloc.dupe(u8, p);
-    return alloc.dupe(u8, "");
-}
