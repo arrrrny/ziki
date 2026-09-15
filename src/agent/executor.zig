@@ -161,15 +161,20 @@ pub const GoalExecutor = struct {
         const msgs = messages.items;
         if (msgs.len < 3) return false; // system + goal + at most one more: nothing trimmable
         // First retained index: keep the last `retain_recent` messages, then
-        // extend backwards over a tool-result run so pairs stay intact.
-        var start = msgs.len - @min(self.retain_recent, msgs.len - 2);
-        while (start > 2 and msgs[start].role == .tool) start -= 1;
-        if (start <= 2) return false; // nothing between the kept head and the window
+        // extend backwards over a tool-result run so pairs stay intact. After
+        // a prior compaction the kept head is 3 messages (system, goal, and
+        // the compaction notice), not 2 — a window landing on the notice can
+        // only re-drop what the rebuild re-adds, yielding nothing.
+        const head: usize = if (self.compactions > 0) 3 else 2;
+        var start = msgs.len - @min(self.retain_recent, msgs.len - head);
+        while (start > head and msgs[start].role == .tool) start -= 1;
+        if (start <= head) return false; // nothing between the kept head and the window
 
         var dropped_tokens: u64 = 0;
-        for (msgs[2..start]) |m| {
+        for (msgs[head..start]) |m| {
             dropped_tokens += estimateTokens(&[_]provider.ChatMessage{m});
         }
+        if (dropped_tokens < 64) return false; // near-zero yield: cannot relieve the budget
 
         var new_arena = std.heap.ArenaAllocator.init(self.alloc);
         errdefer new_arena.deinit();
@@ -252,10 +257,16 @@ pub const GoalExecutor = struct {
                 break :blk provider.CompletionRequest{ .messages = msgs, .tools = specs };
             };
 
-            var io = IoState{ .exec = self, .req = owned_req, .arena = arena };
-            const thread = std.Thread.spawn(.{}, ioWorker, .{&io}) catch |e| {
+            // Heap-allocated so the detached-abort path stays memory-safe: a
+            // stack local would escape scope when the grace window expires and
+            // the worker (still holding the pointer) later writes `io.resp` /
+            // `io.err` / `io.done` into a popped frame.
+            const io = try std.heap.page_allocator.create(IoState);
+            io.* = .{ .exec = self, .req = owned_req, .arena = arena };
+            const thread = std.Thread.spawn(.{}, ioWorker, .{io}) catch |e| {
                 arena.deinit();
                 std.heap.page_allocator.destroy(arena);
+                std.heap.page_allocator.destroy(io);
                 return e;
             };
             var stopped = false;
@@ -282,6 +293,7 @@ pub const GoalExecutor = struct {
                 defer {
                     arena.deinit();
                     std.heap.page_allocator.destroy(arena);
+                    std.heap.page_allocator.destroy(io);
                 }
                 if (stopped or self.stopRequested()) return .aborted; // abort wins: discard
                 if (io.err) |e| {
@@ -296,6 +308,9 @@ pub const GoalExecutor = struct {
                 return .{ .resp = try dupeResponseInto(a, io.resp.?) };
             }
             thread.detach();
+            // The detached worker still owns `io` and its arena; both are
+            // deliberately leaked (bounded KBs) and die with the process —
+            // freeing them here would race the worker's final writes.
             return .aborted;
         }
         unreachable;
@@ -353,9 +368,18 @@ pub const GoalExecutor = struct {
         return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(a, "unknown tool: {s}", .{tc.name}) };
     }
 
-    fn verify(self: *GoalExecutor, a: Allocator, messages: *std.ArrayList(provider.ChatMessage), criterion: []const u8) !bool {
+    /// Criterion verification. Returns `null` when the stop signal fired
+    /// during the completion — the caller maps that to the graceful abort.
+    /// Verification goes through the same interruptible completion as the
+    /// main path so `/stop` is observed during its I/O too (it can be the
+    /// longest single wait of the run).
+    fn verify(self: *GoalExecutor, a: Allocator, messages: *std.ArrayList(provider.ChatMessage), criterion: []const u8) !?bool {
         try messages.append(a, .{ .role = .user, .content = try a.dupe(u8, try std.fmt.allocPrint(a, "Criterion: {s}\nIs it satisfied? Reply with exactly YES or NO.", .{criterion})) });
-        const resp = try self.completeRetry(a, .{ .messages = messages.items, .tools = &[0]provider.ToolSpec{} });
+        const outcome = try self.completeInterruptible(a, .{ .messages = messages.items, .tools = &[0]provider.ToolSpec{} });
+        const resp = switch (outcome) {
+            .aborted => return null,
+            .resp => |r| r,
+        };
         const content = resp.message.content;
         if (self.verbose) logLine(self.alloc, "verbose: verify -> {s}", .{content});
         try messages.append(a, .{ .role = .assistant, .content = try a.dupe(u8, content) });
@@ -363,22 +387,6 @@ pub const GoalExecutor = struct {
         const yes = std.mem.indexOf(u8, upper, "YES") != null;
         a.free(upper);
         return yes;
-    }
-
-    /// Complete a request, retrying transient provider failures. Real HTTP
-    /// providers are occasionally unavailable (5xx, network blips); a bounded
-    /// retry keeps an otherwise-good goal loop from dying on a single bad turn.
-    fn completeRetry(self: *GoalExecutor, a: Allocator, req: provider.CompletionRequest) !provider.ChatResponse {
-        const max_attempts: u32 = 3;
-        var attempt: u32 = 0;
-        while (attempt < max_attempts) : (attempt += 1) {
-            return self.provider.complete(a, req) catch |e| {
-                if (attempt + 1 == max_attempts) return e;
-                std.Thread.sleep(200 * std.time.ns_per_ms);
-                continue;
-            };
-        }
-        unreachable;
     }
 
     /// Run the goal to a terminal state (completed / blocked / aborted),
@@ -509,6 +517,10 @@ pub const GoalExecutor = struct {
                         .content = try a.dupe(u8, res.output),
                         .tool_call_id = try a.dupe(u8, tc.id),
                     });
+                    // Persist after every tool result: a crash mid-loop must
+                    // not desync the store from side effects already on disk
+                    // (resume replays what actually ran).
+                    self.saveHistorySafe(goal.id, messages.items);
                     // A tool run (e.g. Bash) may have observed the stop signal
                     // mid-command: unwind immediately, no further dispatches.
                     if (self.stopRequested()) {
@@ -538,7 +550,13 @@ pub const GoalExecutor = struct {
             }
 
             if (goal.criterion) |crit| {
-                const satisfied = try self.verify(a, &messages, crit);
+                const satisfied = (try self.verify(a, &messages, crit)) orelse {
+                    // Stop observed during verification I/O: same graceful
+                    // abort as the main path.
+                    if (self.stop_path) |p| self.fs.remove(p) catch {};
+                    try self.finish(goal, .aborted, "aborted by user", "aborted by user", "job aborted by user");
+                    return;
+                };
                 if (satisfied) {
                     try self.finish(goal, .completed, "completed: criterion satisfied", null, null);
                     return;
@@ -1087,8 +1105,8 @@ test "compaction trims the middle and the run continues (B7/B8)" {
     var fake = S13FakeFs.init(alloc, "/wd");
     defer fake.deinit();
 
-    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"data\":\"aaaa\"}" }};
-    const tcs2 = [_]provider.ToolCall{.{ .id = "c2", .name = "write_file", .arguments_json = "{\"path\":\"b.txt\",\"data\":\"bbbb\"}" }};
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"data\":\"" ++ "a" ** 200 ++ "\"}" }};
+    const tcs2 = [_]provider.ToolCall{.{ .id = "c2", .name = "write_file", .arguments_json = "{\"path\":\"b.txt\",\"data\":\"" ++ "b" ** 200 ++ "\"}" }};
     const responses = [_]provider.ChatResponse{
         .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 40, .completion_tokens = 0 } },
         .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs2 }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 40, .completion_tokens = 0 } },
@@ -1165,6 +1183,54 @@ test "token budget with nothing trimmable stops gracefully (B9)" {
     var loaded = (try loaded_impl.toRepository().load(alloc)).?;
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.status == .aborted);
+}
+
+test "second over-budget turn after a compaction stops gracefully when relief is trivial (B9)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    // Turn 1 carries enough content for the first compaction to yield real
+    // relief (>= the trivial-yield threshold); turn 2's small pair leaves only
+    // notice + small messages before the window, so a second compaction can
+    // never relieve and the run must stop gracefully instead of looping
+    // notice-only compactions every turn.
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"data\":\"" ++ "a" ** 200 ++ "\"}" }};
+    const tcs2 = [_]provider.ToolCall{.{ .id = "c2", .name = "write_file", .arguments_json = "{\"path\":\"b.txt\",\"data\":\"bb\"}" }};
+    const tcs3 = [_]provider.ToolCall{.{ .id = "c3", .name = "write_file", .arguments_json = "{\"path\":\"c.txt\",\"data\":\"cc\"}" }};
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 40, .completion_tokens = 0 } },
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs2 }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 40, .completion_tokens = 0 } },
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs3 }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 500, .completion_tokens = 0 } },
+        .{ .message = .{ .role = .assistant, .content = "should never be requested" } },
+    };
+    var fp = fake13.FakeProvider.init(&responses);
+    var wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    const wt = wt_impl.toTool();
+    const tools = [_]Tool{wt};
+
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .retain_recent = 2,
+    };
+    var goal = try Goal.init(alloc, "create files", null, "sess1");
+    defer goal.deinit(alloc);
+    goal.budgets.max_tokens = 75;
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .aborted);
+    try std.testing.expectEqualStrings("aborted: token budget exceeded", goal.progress);
+    try std.testing.expectEqual(@as(u32, 1), ex.compactions); // no no-op second compaction
+    try std.testing.expectEqual(@as(usize, 3), fp.idx); // the 4th response was never requested
 }
 
 test "provider-reported usage is summed; estimate used when absent (B10)" {

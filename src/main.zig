@@ -59,8 +59,10 @@ fn emitSummary(goal: *const Goal) !void {
 // ---------------------------------------------------------------------------
 // Goal-run signal handling (spec 013 T13): SIGINT/SIGTERM during a goal run
 // write the stop file so the loop aborts gracefully and saves state instead
-// of dying mid-turn. The handler is async-signal-safe (open/write/close only)
-// and no-ops when no goal run is active.
+// of dying mid-turn. The handler is async-signal-safe (open/write/close, raw
+// _exit only). When no goal run is active it exits 130, restoring stock
+// Ctrl-C behavior — a swallowed SIGINT would make the REPL uninterruptible
+// after the first run.
 // ---------------------------------------------------------------------------
 var g_goal_stop_path: [512]u8 = undefined;
 var g_goal_stop_len: usize = 0;
@@ -68,7 +70,7 @@ var g_goal_active = std.atomic.Value(bool).init(false);
 
 fn goalSignalHandler(sig: i32) callconv(.c) void {
     _ = sig;
-    if (!g_goal_active.load(.acquire)) return;
+    if (!g_goal_active.load(.acquire)) std.posix.exit(130); // no run active: default die
     if (g_goal_stop_len == 0) return;
     const fd = std.posix.open(g_goal_stop_path[0..g_goal_stop_len], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return;
     std.posix.close(fd);
@@ -385,6 +387,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     else
         "push: not requested";
     try emit("  {s}", .{push_line});
+    if (bt.aborted) try emit("  a run_command was aborted mid-run by /stop", .{});
 }
 
 fn runStop(alloc: Allocator, state_dir: []const u8) !void {
@@ -579,6 +582,7 @@ fn runResume(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_i
     else
         "push: not requested";
     try emit("  {s}", .{push_line});
+    if (bt.aborted) try emit("  a run_command was aborted mid-run by /stop", .{});
 }
 
 fn runStatus(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {

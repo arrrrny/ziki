@@ -113,10 +113,11 @@ fn isUnauthorizedGitPush(cmd: []const u8) bool {
 }
 
 /// Spawn the child, drain both stdout and stderr to EOF via `poll`, then reap
-/// with a single `child.wait()`. On timeout the child is signalled (SIGTERM)
-/// and a failure result is returned instead of blocking forever. When `stop`
-/// is provided it is polled every iteration and, on fire, the child is
-/// SIGTERMed and an aborted result is returned (spec 013 T10).
+/// with a single `child.wait()`. On timeout (and on the stop signal) the child
+/// is signalled (SIGTERM), reaped, and a failure result is returned instead of
+/// blocking forever. When `stop` is provided it is polled every iteration and,
+/// on fire, the child is SIGTERMed and an aborted result is returned
+/// (spec 013 T10).
 fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: u64, stop: ?StopProbe, was_aborted: *bool) !ToolResult {
     var out_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer out_buf.deinit(alloc);
@@ -143,6 +144,10 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
             if (p.isStop()) {
                 was_aborted.* = true;
                 std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+                // Reap so the aborted command does not linger as a zombie with
+                // open pipe fds for the life of the session; SIGTERM's default
+                // action ends it promptly.
+                _ = child.wait() catch std.process.Child.Term{ .Exited = 1 };
                 return ToolResult{
                     .ok = false,
                     .error_message = try std.fmt.allocPrint(alloc, "run_command aborted by user", .{}),
@@ -156,6 +161,8 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
             const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - start_ms);
             if (elapsed_ms >= timeout_seconds * 1000) {
                 std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+                // Reap the timed-out child (no zombie / leaked fds).
+                _ = child.wait() catch std.process.Child.Term{ .Exited = 1 };
                 return ToolResult{
                     .ok = false,
                     .error_message = try std.fmt.allocPrint(alloc, "run_command timed out after {d}s", .{timeout_seconds}),
