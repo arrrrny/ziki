@@ -6,6 +6,7 @@ const goal = @import("src/goal/goal.zig");
 const repository = @import("src/goal/repository.zig");
 const provider = @import("src/provider/provider.zig");
 const transport = @import("src/provider/transport.zig");
+const transport_socket = @import("src/provider/transport_socket.zig");
 const transport_tls = @import("src/provider/transport_tls.zig");
 const openai = @import("src/provider/openai.zig");
 const fake = @import("src/provider/fake.zig");
@@ -27,6 +28,7 @@ const skill = @import("src/skill/skill.zig");
 const skill_registry = @import("src/skill/registry.zig");
 const skill_tool = @import("src/skill/tool.zig");
 const skill_handler = @import("src/skill/handler.zig");
+const skill_e2e = @import("src/skill/e2e_test.zig");
 const e2e = @import("src/provider/e2e_test.zig");
 
 test "aggregator loads all modules" {
@@ -36,6 +38,7 @@ test "aggregator loads all modules" {
     _ = repository;
     _ = provider;
     _ = transport;
+    _ = transport_socket;
     _ = transport_tls;
     _ = openai;
     _ = fake;
@@ -57,5 +60,6 @@ test "aggregator loads all modules" {
     _ = skill_registry;
     _ = skill_tool;
     _ = skill_handler;
+    _ = skill_e2e;
     _ = e2e;
 }
