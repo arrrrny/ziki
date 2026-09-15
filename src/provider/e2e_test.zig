@@ -67,19 +67,16 @@ test "e2e: FakeProvider emits tool_calls and preserves call ids" {
 }
 
 test "e2e: presets.build returns a valid provider for every preset" {
-    const names = [_][]const u8{
-        "opencode", "kilo", "zai", "kimi", "openai_custom", "cliproxy",
-    };
     var ft = transport.FakeTransport.init(200, "{}");
     const t = ft.toTransport();
     var built: usize = 0;
-    for (names) |name| {
-        const cfg = try presets.build(std.testing.allocator, name, "", "", "", t);
+    for (presets.PRESETS) |preset| {
+        const cfg = try presets.build(std.testing.allocator, preset.name, "", "", "", t);
         try std.testing.expect(cfg.endpoint.len > 0);
         try std.testing.expect(cfg.model.len > 0);
         built += 1;
     }
-    try std.testing.expectEqual(@as(usize, 6), built);
+    try std.testing.expectEqual(presets.PRESETS.len, built);
 }
 
 test "e2e: presets.build rejects unknown provider" {
