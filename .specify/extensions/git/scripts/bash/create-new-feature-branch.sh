@@ -416,33 +416,6 @@ branch_scope_prefix() {
     render_branch_template "$prefix" "" "$BRANCH_SUFFIX"
 }
 
-# Append `.worktrees/` to the repo .gitignore so freshly created worktrees
-# (nested git checkouts) are never accidentally committed. Idempotent.
-_ensure_worktrees_ignored() {
-    local gi="$REPO_ROOT/.gitignore"
-    if [ ! -f "$gi" ]; then
-        printf '.worktrees/\n' > "$gi"
-        return 0
-    fi
-    if grep -qxF '.worktrees/' "$gi" 2>/dev/null; then
-        return 0
-    fi
-    if [ -s "$gi" ] && [ "$(tail -c1 "$gi" 2>/dev/null)" != "" ]; then
-        printf '\n' >> "$gi"
-    fi
-    printf '.worktrees/\n' >> "$gi"
-}
-
-# Copy the (untracked / gitignored) .specify scaffolding into the new worktree.
-# `git worktree add` only checks out tracked files, so .specify is absent from
-# the fresh checkout; the agent must run Spec Kit commands from inside it.
-# Copies only when missing so re-runs are idempotent.
-_carry_specify_into_worktree() {
-    if [ -d "$REPO_ROOT/.specify" ] && [ ! -e "$WORKTREE_PATH/.specify" ]; then
-        cp -R "$REPO_ROOT/.specify" "$WORKTREE_PATH/.specify" 2>/dev/null || true
-    fi
-}
-
 extract_feature_num_from_branch() {
     local branch_name="$1"
     local feature_segment="${branch_name##*/}"
@@ -464,12 +437,6 @@ AUTHOR_TOKEN=$(get_author_token)
 APP_TOKEN=$(get_app_token)
 BRANCH_TEMPLATE=$(resolve_branch_template)
 validate_branch_template "$BRANCH_TEMPLATE"
-
-CREATE_WORKTREE_VAL=$(read_git_config_value "create_worktree" | tr '[:upper:]' '[:lower:]')
-case "$CREATE_WORKTREE_VAL" in
-    true|1|yes|on) CREATE_WORKTREE=true ;;
-    *) CREATE_WORKTREE=false ;;
-esac
 
 # Function to generate branch name with stop word filtering
 generate_branch_name() {
@@ -583,57 +550,8 @@ elif [ "$BRANCH_BYTE_LEN" -gt $MAX_BRANCH_LENGTH ]; then
     >&2 echo "[specify] Truncated to: $BRANCH_NAME (${TRUNCATED_BRANCH_BYTE_LEN} bytes)"
 fi
 
-if [ "$CREATE_WORKTREE" = true ]; then
-    if [ -n "${SPECIFY_WORKTREE_PATH:-}" ]; then
-        WORKTREE_PATH="$SPECIFY_WORKTREE_PATH"
-    else
-        WORKTREE_PATH="$REPO_ROOT/.worktrees/$BRANCH_NAME"
-    fi
-fi
-
 if [ "$DRY_RUN" != true ]; then
-    if [ "$CREATE_WORKTREE" = true ] && [ "$HAS_GIT" = true ]; then
-        # Create a worktree (and feature branch) instead of a branch only,
-        # leaving the primary checkout untouched for parallel feature work.
-        worktree_failed=false
-        branch_create_error=""
-        if git branch --list "$BRANCH_NAME" | grep -q .; then
-            if [ "$ALLOW_EXISTING" = true ]; then
-                if ! branch_create_error=$(git worktree add -q "$WORKTREE_PATH" "$BRANCH_NAME" 2>&1); then
-                    worktree_failed=true
-                fi
-            elif [ "$USE_TIMESTAMP" = true ]; then
-                >&2 echo "Error: Branch '$BRANCH_NAME' already exists. Rerun to get a new timestamp or use a different --short-name."
-                exit 1
-            else
-                >&2 echo "Error: Branch '$BRANCH_NAME' already exists. Please use a different feature name or specify a different number with --number."
-                exit 1
-            fi
-        else
-            if ! branch_create_error=$(git worktree add -q -b "$BRANCH_NAME" "$WORKTREE_PATH" 2>&1); then
-                worktree_failed=true
-            fi
-        fi
-        if [ "$worktree_failed" = true ]; then
-            # A worktree already registered at this path (created by a previous
-            # run) is a benign duplicate: treat it as success.
-            if git worktree list --porcelain 2>/dev/null | grep -q "^worktree $WORKTREE_PATH$"; then
-                _ensure_worktrees_ignored
-                _carry_specify_into_worktree
-            else
-                >&2 echo "Error: Failed to create git worktree '$WORKTREE_PATH'."
-                if [ -n "$branch_create_error" ]; then
-                    >&2 printf '%s\n' "$branch_create_error"
-                else
-                    >&2 echo "Please check your git configuration and try again."
-                fi
-                exit 1
-            fi
-        else
-            _ensure_worktrees_ignored
-            _carry_specify_into_worktree
-        fi
-    elif [ "$HAS_GIT" = true ]; then
+    if [ "$HAS_GIT" = true ]; then
         branch_create_error=""
         if ! branch_create_error=$(git checkout -q -b "$BRANCH_NAME" 2>&1); then
             current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
@@ -674,28 +592,26 @@ fi
 
 if $JSON_MODE; then
     if command -v jq >/dev/null 2>&1; then
-        jq -cn \
-            --arg branch_name "$BRANCH_NAME" \
-            --arg feature_num "$FEATURE_NUM" \
-            --arg worktree_path "$WORKTREE_PATH" \
-            --argjson create_wt "$CREATE_WORKTREE" \
-            --argjson dry_run "$DRY_RUN" \
-            '{BRANCH_NAME:$branch_name,FEATURE_NUM:$feature_num} + (if $create_wt then {WORKTREE_PATH:$worktree_path} else {} end) + (if $dry_run then {DRY_RUN:true} else {} end)'
+        if [ "$DRY_RUN" = true ]; then
+            jq -cn \
+                --arg branch_name "$BRANCH_NAME" \
+                --arg feature_num "$FEATURE_NUM" \
+                '{BRANCH_NAME:$branch_name,FEATURE_NUM:$feature_num,DRY_RUN:true}'
+        else
+            jq -cn \
+                --arg branch_name "$BRANCH_NAME" \
+                --arg feature_num "$FEATURE_NUM" \
+                '{BRANCH_NAME:$branch_name,FEATURE_NUM:$feature_num}'
+        fi
     else
         if type json_escape >/dev/null 2>&1; then
             _je_branch=$(json_escape "$BRANCH_NAME")
             _je_num=$(json_escape "$FEATURE_NUM")
-            _je_wt=$(json_escape "$WORKTREE_PATH")
         else
             _je_branch="$BRANCH_NAME"
             _je_num="$FEATURE_NUM"
-            _je_wt="$WORKTREE_PATH"
         fi
-        if [ "$CREATE_WORKTREE" = true ] && [ "$DRY_RUN" = true ]; then
-            printf '{"BRANCH_NAME":"%s","FEATURE_NUM":"%s","WORKTREE_PATH":"%s","DRY_RUN":true}\n' "$_je_branch" "$_je_num" "$_je_wt"
-        elif [ "$CREATE_WORKTREE" = true ]; then
-            printf '{"BRANCH_NAME":"%s","FEATURE_NUM":"%s","WORKTREE_PATH":"%s"}\n' "$_je_branch" "$_je_num" "$_je_wt"
-        elif [ "$DRY_RUN" = true ]; then
+        if [ "$DRY_RUN" = true ]; then
             printf '{"BRANCH_NAME":"%s","FEATURE_NUM":"%s","DRY_RUN":true}\n' "$_je_branch" "$_je_num"
         else
             printf '{"BRANCH_NAME":"%s","FEATURE_NUM":"%s"}\n' "$_je_branch" "$_je_num"
@@ -704,9 +620,6 @@ if $JSON_MODE; then
 else
     echo "BRANCH_NAME: $BRANCH_NAME"
     echo "FEATURE_NUM: $FEATURE_NUM"
-    if [ "$CREATE_WORKTREE" = true ]; then
-        echo "WORKTREE_PATH: $WORKTREE_PATH"
-    fi
     if [ "$DRY_RUN" != true ]; then
         printf '# To persist in your shell: export SPECIFY_FEATURE=%q\n' "$BRANCH_NAME"
     fi

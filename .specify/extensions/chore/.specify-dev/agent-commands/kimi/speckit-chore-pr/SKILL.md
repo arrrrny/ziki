@@ -10,7 +10,7 @@ metadata:
 # Open Chore Pull Request
 
 Open a GitHub pull request for the chore recorded by
-`/skill:speckit-chore-implement`. This command reads
+`/speckit-chore-implement`. This command reads
 `.specify/chores/<slug>/implement.md` (and `issue.md` if the chore was reported)
 and creates a PR via the `gh` CLI from the current branch, linking the issue. If
 `gh` or a GitHub remote is unavailable, it writes a ready-to-paste PR draft instead.
@@ -34,7 +34,7 @@ Accept any of:
 Resolve `CHORE_SLUG` in this order, stopping at the first match:
 
 1. **Explicit user input** — a slug passed in `$ARGUMENTS` (any of the forms above).
-2. **Conversation context** — if the current session has just run `/skill:speckit-chore-implement` (or `chore.issue`), the slug it reported is the working slug. Reuse it without re-prompting.
+2. **Conversation context** — if the current session has just run `/speckit-chore-implement` (or `chore.issue`), the slug it reported is the working slug. Reuse it without re-prompting.
 3. **Single candidate on disk** — list `.specify/chores/*/implement.md`. If exactly one chore has an `implement.md`, use it.
 4. **Disambiguate**:
    - **Interactive mode**: ask the user which chore to open a PR for and list the candidates.
@@ -44,7 +44,7 @@ Once resolved, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>`.
 
 ## Prerequisites
 
-- `CHORE_DIR/implement.md` MUST exist. If it does not, stop and instruct the user to run `/skill:speckit-chore-implement` first.
+- `CHORE_DIR/implement.md` MUST exist. If it does not, stop and instruct the user to run `/speckit-chore-implement` first.
 - Confirm the current branch is the chore branch (created by `chore.implement --branch`, or whatever branch holds the change). If the working tree is on `main`/`master` with uncommitted changes, warn the user and ask which branch to open the PR from before continuing.
 - Detect GitHub context (same as `chore.issue`):
   - `git rev-parse --is-inside-work-tree` and `git config --get remote.origin.url` to parse `owner`/`repo`; only proceed live when the remote is `github.com`.

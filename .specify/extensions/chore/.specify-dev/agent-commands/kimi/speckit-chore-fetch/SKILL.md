@@ -1,6 +1,7 @@
 ---
 name: speckit-chore-fetch
-description: Load an existing GitHub issue into the chore workflow and seed a triage draft
+description: Load an existing GitHub issue into the chore workflow and seed a triage
+  draft
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -10,11 +11,11 @@ metadata:
 # Fetch Chore (Load Existing Issue)
 
 Load an existing GitHub issue into the local chore workflow. This is the
-**complement** of `/skill:speckit-chore-issue`, which *creates* an issue —
+**complement** of `/speckit-chore-issue`, which *creates* an issue —
 `fetch` *loads* one that already exists. It pulls the issue via the `gh` CLI,
 records it at `.specify/chores/<slug>/issue.md`, and seeds
 `.specify/chores/<slug>/assessment.md` so the rest of the pipeline
-(`/skill:speckit-chore-implement`, `/skill:speckit-chore-pr`) can proceed.
+(`/speckit-chore-implement`, `/speckit-chore-pr`) can proceed.
 
 Use `fetch` when a chore is already tracked on GitHub (reported by someone else,
 or from another session) and you want to scope and implement it here. `fetch`
@@ -43,7 +44,7 @@ After resolution, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>
 
 - Ensure `.specify/chores/<CHORE_SLUG>/` exists (create it, including any missing parents, if necessary).
 - If `CHORE_DIR/issue.md` already exists, do **not** re-fetch silently: report the existing link and stop (unless the user explicitly asks to refresh). If they ask to refresh, overwrite `issue.md`; never clobber `assessment.md`/`implement.md` — only regenerate `assessment.md` if it is missing or with explicit confirmation.
-- Detect GitHub context (same as `/skill:speckit-chore-issue`):
+- Detect GitHub context (same as `/speckit-chore-issue`):
   - `git rev-parse --is-inside-work-tree 2>/dev/null` to confirm a repository.
   - `git config --get remote.origin.url` to read the remote; parse `owner`/`repo` (HTTPS `https://github.com/<owner>/<repo>.git` or SSH `git@github.com:<owner>/<repo>.git`). Only proceed with a live fetch when the remote points to `github.com`.
   - `command -v gh >/dev/null 2>&1` and `gh auth status` to confirm the CLI and auth. If `gh`/GitHub remote/auth is unavailable, skip the live fetch and write a draft (see Graceful Degradation).
@@ -90,7 +91,7 @@ After resolution, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>
      ```
 
 4. **Seed the assessment draft**
-   - Write `CHORE_DIR/assessment.md` **only if it does not already exist**. If it exists, leave it and note that the user can run `/skill:speckit-chore-assess` to refine the scope:
+   - Write `CHORE_DIR/assessment.md` **only if it does not already exist**. If it exists, leave it and note that the user can run `/speckit-chore-assess` to refine the scope:
      ```markdown
      # Chore Assessment: <short title>
 
@@ -114,11 +115,11 @@ After resolution, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>
 
      ## Affected Paths
 
-     [NEEDS CLARIFICATION — run /skill:speckit-chore-assess to locate the code/assets, or fill in manually.]
+     [NEEDS CLARIFICATION — run /speckit-chore-assess to locate the code/assets, or fill in manually.]
 
      ## Proposed Approach
 
-     [NEEDS CLARIFICATION — run /skill:speckit-chore-assess to propose an approach, or apply it directly with /skill:speckit-chore-implement.]
+     [NEEDS CLARIFICATION — run /speckit-chore-assess to propose an approach, or apply it directly with /speckit-chore-implement.]
 
      ## Risks & Considerations
 
@@ -128,7 +129,7 @@ After resolution, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>
 
      - [NEEDS CLARIFICATION: …]
      ```
-   - This scaffold lets `/skill:speckit-chore-implement` and `/skill:speckit-chore-pr` run. The user can refine it by editing directly or by running `/skill:speckit-chore-assess` (which asks before overwriting the existing `assessment.md`).
+   - This scaffold lets `/speckit-chore-implement` and `/speckit-chore-pr` run. The user can refine it by editing directly or by running `/speckit-chore-assess` (which asks before overwriting the existing `assessment.md`).
 
 5. **Graceful Degradation (no live fetch)**
    - When `gh`/GitHub remote/auth is unavailable, instead write `CHORE_DIR/issue-draft.md` containing:
@@ -140,9 +141,9 @@ After resolution, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>
    - The slug and the issue URL (or the draft path).
    - The issue state (`open`/`closed`) — flag `closed` explicitly so the user knows.
    - The next suggested steps, in order:
-     - `/skill:speckit-chore-assess slug=<CHORE_SLUG>` (refine the triage draft into a full assessment) — optional.
-     - `/skill:speckit-chore-implement slug=<CHORE_SLUG>` (apply the chore; add `--branch` or `--worktree` to isolate).
-     - Then: `/skill:speckit-chore-pr slug=<CHORE_SLUG>` (open a PR linking the issue; reuses `Closes #<number>` from `issue.md`).
+     - `/speckit-chore-assess slug=<CHORE_SLUG>` (refine the triage draft into a full assessment) — optional.
+     - `/speckit-chore-implement slug=<CHORE_SLUG>` (apply the chore; add `--branch` or `--worktree` to isolate).
+     - Then: `/speckit-chore-pr slug=<CHORE_SLUG>` (open a PR linking the issue; reuses `Closes #<number>` from `issue.md`).
 
 ## Guardrails
 

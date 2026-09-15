@@ -1,6 +1,7 @@
 ---
 name: speckit-chore-issue
-description: File a GitHub issue from a chore assessment (the 'report' phase) and record the issue link
+description: File a GitHub issue from a chore assessment (the 'report' phase) and
+  record the issue link
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -11,7 +12,7 @@ metadata:
 
 Turn a local chore assessment into a tracked GitHub issue. This command reads
 `.specify/chores/<slug>/assessment.md` (produced by
-`/skill:speckit-chore-assess`) and creates a GitHub issue via the `gh` CLI,
+`/speckit-chore-assess`) and creates a GitHub issue via the `gh` CLI,
 then records the issue number and URL in `CHORE_DIR/issue.md`. If `gh` or a GitHub
 remote is unavailable, it writes a ready-to-paste draft instead so no work is lost.
 
@@ -32,7 +33,7 @@ Accept any of:
 Resolve `CHORE_SLUG` in this order, stopping at the first match:
 
 1. **Explicit user input** — a slug passed in `$ARGUMENTS` (any of the forms above).
-2. **Conversation context** — if the current session has just run `/skill:speckit-chore-assess`, the slug it reported is the working slug. Reuse it without re-prompting.
+2. **Conversation context** — if the current session has just run `/speckit-chore-assess`, the slug it reported is the working slug. Reuse it without re-prompting.
 3. **Single candidate on disk** — list `.specify/chores/*/assessment.md`. If exactly one matching `assessment.md` is found, use the slug from its parent directory.
 4. **Disambiguate**:
    - **Interactive mode**: ask the user which chore to report and list the candidates.
@@ -42,7 +43,7 @@ Once resolved, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>`.
 
 ## Prerequisites
 
-- `CHORE_DIR/assessment.md` MUST exist. If it does not, stop and instruct the user to run `/skill:speckit-chore-assess` first.
+- `CHORE_DIR/assessment.md` MUST exist. If it does not, stop and instruct the user to run `/speckit-chore-assess` first.
 - Read `CHORE_DIR/assessment.md` in full. Treat its **Summary**, **Affected Paths**, **Proposed Approach**, **Constitution Check**, and **Source** fields as the basis for the issue.
 - Detect GitHub context:
   - Run `git rev-parse --is-inside-work-tree 2>/dev/null` to confirm a repository.
@@ -94,7 +95,7 @@ Once resolved, set `CHORE_SLUG` and `CHORE_DIR = .specify/chores/<CHORE_SLUG>`.
 
 6. **Report back** with:
    - The slug and the issue URL (or the draft path).
-   - The next suggested step: `/skill:speckit-chore-implement slug=<CHORE_SLUG>`.
+   - The next suggested step: `/speckit-chore-implement slug=<CHORE_SLUG>`.
 
 ## Guardrails
 

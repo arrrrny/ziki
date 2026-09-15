@@ -48,7 +48,6 @@ Environment variables:
 Configuration:
   branch_template     Optional git-config.yml template with {{author}}, {{app}}, {{number}}, {{slug}}
   branch_prefix       Optional shorthand namespace expanded before {{number}}-{{slug}}
-  create_worktree     When true, create a git worktree instead of a branch (default false)
 
 Examples:
   create_new_feature_branch.py 'Add user authentication system' --short-name 'user-auth'
@@ -415,130 +414,6 @@ def _byte_length(value: str) -> int:
     return len(value.encode("utf-8"))
 
 
-def read_create_worktree(config_file: Path) -> bool:
-    """Read the ``create_worktree`` toggle from git-config.yml (default false)."""
-    value = read_git_config_value(config_file, "create_worktree").strip().lower()
-    return value in ("true", "1", "yes", "on")
-
-
-def resolve_worktree_path(repo_root: Path, branch_name: str) -> str:
-    """Resolve the worktree directory.
-
-    Honors ``SPECIFY_WORKTREE_PATH``; otherwise places the worktree inside the
-    project under ``.worktrees/<branch>`` so the agent can ``cd`` into it
-    easily.
-    """
-    override = os.environ.get("SPECIFY_WORKTREE_PATH", "").strip()
-    if override:
-        return override
-    return str(repo_root / ".worktrees" / branch_name)
-
-
-def _branch_already_exists_error(branch_name: str, use_timestamp: bool) -> None:
-    """Emit the same 'already exists' error as the branch-only code path."""
-    if use_timestamp:
-        _err(
-            f"Error: Branch '{branch_name}' already exists. Rerun to get "
-            "a new timestamp or use a different --short-name."
-        )
-    else:
-        _err(
-            f"Error: Branch '{branch_name}' already exists. Please use a different "
-            "feature name or specify a different number with --number."
-        )
-
-
-def _worktree_registered(repo_root: Path, worktree_path: str) -> bool:
-    """True when ``worktree_path`` is already a registered git worktree."""
-    listed = _git_lines(repo_root, "worktree", "list", "--porcelain")
-    return any(line == f"worktree {worktree_path}" for line in listed)
-
-
-def _ensure_worktrees_ignored(repo_root: Path) -> None:
-    """Append ``.worktrees/`` to the repo ``.gitignore`` so freshly created
-    worktrees (nested git checkouts) are never accidentally committed.
-
-    Idempotent: no-op when the entry is already present. Failures are swallowed
-    so worktree creation is never blocked by a read-only or missing .gitignore.
-    """
-    gitignore = repo_root / ".gitignore"
-    try:
-        if not gitignore.is_file():
-            gitignore.write_text(".worktrees/\n", encoding="utf-8")
-            return
-        lines = gitignore.read_text(encoding="utf-8").splitlines()
-        if any(line.strip() == ".worktrees/" for line in lines):
-            return
-        with gitignore.open("a", encoding="utf-8") as fh:
-            if lines and lines[-1]:
-                fh.write("\n")
-            fh.write(".worktrees/\n")
-    except (OSError, UnicodeDecodeError):
-        return
-
-
-def _carry_specify_into_worktree(repo_root: Path, worktree_path: str) -> None:
-    """Copy the (untracked / gitignored) ``.specify`` scaffolding into the worktree.
-
-    ``git worktree add`` only checks out tracked files, so ``.specify`` — which is
-    typically untracked or gitignored — is absent from the fresh checkout. The agent
-    must run subsequent Spec Kit commands from inside the worktree, and those need
-    ``.specify`` (scripts, extensions, configs). Copy it only when missing so re-runs
-    stay idempotent and never clobber agent edits made inside the worktree.
-    """
-    src = repo_root / ".specify"
-    dst = Path(worktree_path) / ".specify"
-    if not src.is_dir() or dst.exists():
-        return
-    shutil.copytree(src, dst)
-
-
-def _create_worktree(
-    repo_root: Path,
-    branch_name: str,
-    worktree_path: str,
-    allow_existing: bool,
-    use_timestamp: bool,
-) -> None:
-    """Create a git worktree (and the feature branch) instead of a branch only.
-
-    The primary checkout is left untouched so parallel feature work can proceed.
-    """
-    branch_exists = bool(_git_lines(repo_root, "branch", "--list", branch_name))
-    if branch_exists and not allow_existing:
-        _branch_already_exists_error(branch_name, use_timestamp)
-        raise SystemExit(1)
-    if branch_exists:
-        create = subprocess.run(
-            ["git", "worktree", "add", "-q", worktree_path, branch_name],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-    else:
-        create = subprocess.run(
-            ["git", "worktree", "add", "-q", "-b", branch_name, worktree_path],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-    if create.returncode != 0:
-        # An existing worktree at this path (created by a previous run) is a
-        # benign duplicate: treat it as success rather than failing.
-        if _worktree_registered(repo_root, worktree_path):
-            _ensure_worktrees_ignored(repo_root)
-            _carry_specify_into_worktree(repo_root, worktree_path)
-            return
-        _err(f"Error: Failed to create git worktree '{worktree_path}'.")
-        if create.stderr.strip():
-            _err(create.stderr.strip())
-        else:
-            _err("Please check your git configuration and try again.")
-        raise SystemExit(1)
-    _ensure_worktrees_ignored(repo_root)
-    _carry_specify_into_worktree(repo_root, worktree_path)
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -592,8 +467,6 @@ def main(argv: list[str]) -> int:
 
     specs_dir = repo_root / "specs"
     config_file = repo_root / ".specify" / "extensions" / "git" / "git-config.yml"
-
-    create_worktree = read_create_worktree(config_file)
 
     author_token = get_author_token(repo_root)
     app_token = get_app_token(repo_root)
@@ -677,18 +550,8 @@ def main(argv: list[str]) -> int:
         )
         _err(f"[specify] Truncated to: {branch_name} ({_byte_length(branch_name)} bytes)")
 
-    worktree_path = resolve_worktree_path(repo_root, branch_name) if create_worktree else ""
-
     if not args.dry_run:
-        if create_worktree and has_git_repo:
-            _create_worktree(
-                repo_root,
-                branch_name,
-                worktree_path,
-                args.allow_existing,
-                args.use_timestamp,
-            )
-        elif has_git_repo:
+        if has_git_repo:
             create = subprocess.run(
                 ["git", "checkout", "-q", "-b", branch_name],
                 cwd=repo_root,
@@ -752,16 +615,12 @@ def main(argv: list[str]) -> int:
             "BRANCH_NAME": branch_name,
             "FEATURE_NUM": feature_num,
         }
-        if create_worktree:
-            payload["WORKTREE_PATH"] = worktree_path
         if args.dry_run:
             payload["DRY_RUN"] = True
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     else:
         print(f"BRANCH_NAME: {branch_name}")
         print(f"FEATURE_NUM: {feature_num}")
-        if create_worktree:
-            print(f"WORKTREE_PATH: {worktree_path}")
         if not args.dry_run:
             print(
                 "# To persist in your shell: "

@@ -1,6 +1,7 @@
 ---
 name: speckit-bug-issue
-description: File a GitHub issue from a bug assessment (the 'report' phase) and record the issue link
+description: File a GitHub issue from a bug assessment (the 'report' phase) and record
+  the issue link
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -9,7 +10,7 @@ metadata:
 
 # Report Bug (Create Issue)
 
-Turn a local bug assessment into a tracked GitHub issue. This command reads `.specify/bugs/<slug>/assessment.md` (produced by `/skill:speckit-bug-assess`) and creates a GitHub issue via the `gh` CLI, then records the issue number and URL in `BUG_DIR/issue.md`. If `gh` or a GitHub remote is unavailable, it writes a ready-to-paste draft instead so no work is lost.
+Turn a local bug assessment into a tracked GitHub issue. This command reads `.specify/bugs/<slug>/assessment.md` (produced by `/speckit-bug-assess`) and creates a GitHub issue via the `gh` CLI, then records the issue number and URL in `BUG_DIR/issue.md`. If `gh` or a GitHub remote is unavailable, it writes a ready-to-paste draft instead so no work is lost.
 
 ## User Input
 
@@ -28,7 +29,7 @@ Accept any of:
 Resolve `BUG_SLUG` in this order, stopping at the first match:
 
 1. **Explicit user input** — a slug passed in `$ARGUMENTS` (any of the forms above).
-2. **Conversation context** — if the current session has just run `/skill:speckit-bug-assess`, the slug it reported is the working slug. Reuse it without re-prompting.
+2. **Conversation context** — if the current session has just run `/speckit-bug-assess`, the slug it reported is the working slug. Reuse it without re-prompting.
 3. **Single candidate on disk** — list `.specify/bugs/*/assessment.md`. If exactly one matching `assessment.md` is found, use the slug from its parent directory.
 4. **Disambiguate**:
    - **Interactive mode**: ask the user which bug to report and list the candidates.
@@ -38,7 +39,7 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
 ## Prerequisites
 
-- `BUG_DIR/assessment.md` MUST exist. If it does not, stop and instruct the user to run `/skill:speckit-bug-assess` first.
+- `BUG_DIR/assessment.md` MUST exist. If it does not, stop and instruct the user to run `/speckit-bug-assess` first.
 - Read `BUG_DIR/assessment.md` in full. Treat its **Symptom**, **Reproduction**, **Suspected Code Paths**, **Root Cause Hypothesis**, **Severity**, and **Source** fields as the basis for the issue.
 - Detect GitHub context:
   - Run `git rev-parse --is-inside-work-tree 2>/dev/null` to confirm a repository.
@@ -91,7 +92,7 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
 6. **Report back** with:
    - The slug and the issue URL (or the draft path).
-   - The next suggested step: `/skill:speckit-bug-fix slug=<BUG_SLUG>`.
+   - The next suggested step: `/speckit-bug-fix slug=<BUG_SLUG>`.
 
 ## Guardrails
 

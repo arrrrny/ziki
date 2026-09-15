@@ -62,31 +62,12 @@ Run the appropriate script based on your platform:
 - **PowerShell**: `.specify/extensions/git/scripts/powershell/create-new-feature-branch.ps1 -Json -ShortName "<short-name>" "<feature description>"`
 - **PowerShell (timestamp)**: `.specify/extensions/git/scripts/powershell/create-new-feature-branch.ps1 -Json -Timestamp -ShortName "<short-name>" "<feature description>"`
 
-## Worktree Activation (MANDATORY when `create_worktree: true`)
-
-If the JSON output contains `WORKTREE_PATH`, you **MUST** automatically switch the
-working directory into that worktree immediately after the script returns, and run
-every subsequent Spec Kit command from there. This is not optional: the primary
-checkout must stay on its original branch, and the spec, plan, and tasks must be
-created inside the worktree so the feature is fully isolated.
-
-- Parse `WORKTREE_PATH` from the script's JSON output.
-- Change directory into it before doing anything else:
-  - **Bash**: `cd "$WORKTREE_PATH"`
-  - **PowerShell**: `Set-Location "$env:WORKTREE_PATH"`
-- Verify the switch with `git rev-parse --show-toplevel`; it must match the worktree
-  directory, not the primary checkout.
-- Continue the workflow (e.g. `__SPECKIT_COMMAND_SPECIFY__`) from the worktree root.
-- If `WORKTREE_PATH` is absent, the feature branch was created on the current checkout
-  as usual — do not change directory.
-
 **IMPORTANT**:
 - Do NOT pass `--number` — the script determines the correct next number automatically
 - Always include the JSON flag (`--json` for Bash, `-Json` for PowerShell) so the output can be parsed reliably
 - You must only ever run this script once per feature
-- The JSON output will contain `BRANCH_NAME` and `FEATURE_NUM`, and `WORKTREE_PATH` when worktree mode is active
+- The JSON output will contain `BRANCH_NAME` and `FEATURE_NUM`
 - Do not manually expand `branch_template`; the script reads the git extension config and applies it consistently
-- When `WORKTREE_PATH` is present, switching into it (above) is mandatory before any further steps
 
 ## Graceful Degradation
 
@@ -94,27 +75,8 @@ If Git is not installed or the current directory is not a Git repository:
 - Branch creation is skipped with a warning: `[specify] Warning: Git repository not detected; skipped branch creation`
 - The script still outputs `BRANCH_NAME` and `FEATURE_NUM` so the caller can reference them
 
-## Worktree Mode
-
-If `.specify/extensions/git/git-config.yml` sets `create_worktree: true`, the script
-creates a git worktree for the new feature branch instead of checking out the branch
-on the current checkout. Concretely it runs `git worktree add -b <branch> <path>`
-(attaching to an existing branch with `git worktree add <path> <branch>` when
-`--allow-existing-branch` is given), leaving `HEAD` of the primary checkout untouched
-so multiple features can be worked on in parallel.
-
-- By default the worktree is created inside the project at
-  `.worktrees/<branch>` (e.g. `myproject/.worktrees/003-user-auth`).
-- Override the computed path with the `SPECIFY_WORKTREE_PATH` environment variable.
-- The script still outputs `BRANCH_NAME` (the branch name) and `FEATURE_NUM`; when
-  worktree mode is active it additionally outputs `WORKTREE_PATH` (the worktree
-  directory). **You MUST `cd` into `WORKTREE_PATH` automatically** — see the
-  *Worktree Activation* section above — so the rest of the Spec Kit workflow runs
-  inside the worktree rather than the primary checkout.
-
 ## Output
 
 The script outputs JSON with:
 - `BRANCH_NAME`: The branch name (e.g., `003-user-auth`, `20260319-143022-user-auth`, or `jdoe/web/003-user-auth`)
 - `FEATURE_NUM`: The numeric or timestamp prefix used
-- `WORKTREE_PATH`: (only when `create_worktree: true`) The worktree directory created for the feature

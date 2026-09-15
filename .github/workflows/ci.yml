@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: zig build test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Restore zig cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: ${{ runner.os }}-zig-0.15.2-${{ hashFiles('**/*.zig', 'build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-0.15.2-
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Test
+        run: zig build test --summary all

@@ -1,6 +1,7 @@
 ---
 name: speckit-bug-test
-description: Validate that a previously fixed bug is resolved and record the verification report
+description: Validate that a previously fixed bug is resolved and record the verification
+  report
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -9,7 +10,7 @@ metadata:
 
 # Test Bug Fix
 
-Validate that the fix recorded by `/skill:speckit-bug-fix` actually resolves the bug described by `/skill:speckit-bug-assess`. The output is a verification report at `.specify/bugs/<slug>/test.md`.
+Validate that the fix recorded by `/speckit-bug-fix` actually resolves the bug described by `/speckit-bug-assess`. The output is a verification report at `.specify/bugs/<slug>/test.md`.
 
 ## User Input
 
@@ -28,7 +29,7 @@ The user input should identify the bug to validate. Accept any of:
 Resolve `BUG_SLUG` in this order, stopping at the first match:
 
 1. **Explicit user input** — a slug passed in `$ARGUMENTS` (any of the forms above).
-2. **Conversation context** — if the current session has just run `/skill:speckit-bug-assess` or `/skill:speckit-bug-fix`, the slug it reported is the working slug. Reuse it without re-prompting. Confirm it by checking that `.specify/bugs/<slug>/fix.md` exists; if it does not, fall through.
+2. **Conversation context** — if the current session has just run `/speckit-bug-assess` or `/speckit-bug-fix`, the slug it reported is the working slug. Reuse it without re-prompting. Confirm it by checking that `.specify/bugs/<slug>/fix.md` exists; if it does not, fall through.
 3. **Single candidate on disk** — list `.specify/bugs/*/fix.md`. If exactly one bug has a `fix.md`, use it.
 4. **Disambiguate**:
    - **Interactive mode**: ask the user which bug to validate and list the candidates.
@@ -39,11 +40,29 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`, and brie
 ## Prerequisites
 
 - `BUG_DIR/assessment.md` MUST exist.
-- `BUG_DIR/fix.md` MUST exist. If not, stop and instruct the user to run `/skill:speckit-bug-fix` first.
+- `BUG_DIR/fix.md` MUST exist. If not, stop and instruct the user to run `/speckit-bug-fix` first.
 - If `BUG_DIR/test.md` already exists, ask the user whether to overwrite it (interactive mode) or refuse (automated mode).
 - Read both `assessment.md` and `fix.md` in full so you know:
   - The original symptom and reproduction steps (from `assessment.md`).
   - The actual code changes and tests added (from `fix.md`).
+
+## TDD mode (when `tdd_enabled: true` in bug-config.yml)
+
+When `tdd_enabled` is `true` (the default), validation is driven by the TDD
+extension's auditor rather than the manual check table:
+
+1. **Pin the bug as the TDD feature** — set `.specify/feature.json` so
+   `feature_directory` points at `BUG_DIR` (e.g. `.specify/bugs/<slug>`). This is where
+   `bug.fix` (TDD mode) wrote `tdd/test-list.md`, `tdd/cycle-log.md`, and the fix itself.
+2. **Audit** — run `/speckit.tdd.verify` against `BUG_DIR`. It reads the TDD artifacts
+   from cold context (test-first evidence, red-phase evidence, test smells, mutation
+   results, acceptance-criteria coverage) and writes `BUG_DIR/tdd/verification.md` with a
+   verdict (`PASS` / `PASS_WITH_GAPS` / `FAIL` / `BLOCKED`).
+3. **Fold the verdict into this report** — in step 4, record the `tdd/verification.md`
+   path and map its verdict to this command's result:
+   `PASS` / `PASS_WITH_GAPS` → `verified`, `FAIL` → `failed`, `BLOCKED` → report and stop.
+   The manual check table (step 2) may still be run for extra confidence but is not the
+   source of truth in TDD mode.
 
 ## Execution
 
@@ -80,6 +99,7 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`, and brie
    - **Assessment**: ./assessment.md
    - **Fix**: ./fix.md
    - **Result**: verified | partial | failed
+   - **TDD verification**: ./tdd/verification.md (present only when validation ran in TDD mode)
 
    ## Summary
 
@@ -107,13 +127,13 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`, and brie
    <One paragraph. Examples:>
    - "Close the bug — verified end-to-end."
    - "Hold — reproduction inconclusive; needs verification in staging."
-   - "Reopen — symptom still reproduces; rerun `/skill:speckit-bug-assess`."
+   - "Reopen — symptom still reproduces; rerun `/speckit-bug-assess`."
    ```
 
 5. **Report back** with:
    - The slug and `BUG_DIR/test.md` path.
    - The result (`verified`, `partial`, `failed`).
-   - If the result is `failed`, recommend re-running `/skill:speckit-bug-assess` with the new evidence captured in `test.md`.
+   - If the result is `failed`, recommend re-running `/speckit-bug-assess` with the new evidence captured in `test.md`.
 
 ## Guardrails
 

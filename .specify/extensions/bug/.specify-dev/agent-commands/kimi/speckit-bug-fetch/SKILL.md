@@ -1,6 +1,7 @@
 ---
 name: speckit-bug-fetch
-description: Load an existing GitHub issue into the bug workflow (the complement of bug.issue) and seed a triage draft
+description: Load an existing GitHub issue into the bug workflow (the complement of
+  bug.issue) and seed a triage draft
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -9,7 +10,7 @@ metadata:
 
 # Fetch Bug (Load Existing Issue)
 
-Load an existing GitHub issue into the local bug workflow. This is the **complement** of `/skill:speckit-bug-issue`, which *creates* an issue — `fetch` *loads* one that already exists. It pulls the issue via the `gh` CLI, records it at `.specify/bugs/<slug>/issue.md`, and seeds `.specify/bugs/<slug>/assessment.md` so the rest of the pipeline (`/skill:speckit-bug-fix`, `/skill:speckit-bug-test`) can proceed.
+Load an existing GitHub issue into the local bug workflow. This is the **complement** of `/speckit-bug-issue`, which *creates* an issue — `fetch` *loads* one that already exists. It pulls the issue via the `gh` CLI, records it at `.specify/bugs/<slug>/issue.md`, and seeds `.specify/bugs/<slug>/assessment.md` so the rest of the pipeline (`/speckit-bug-fix`, `/speckit-bug-test`) can proceed.
 
 Use `fetch` when a bug is already tracked on GitHub (reported by someone else, or from another session) and you want to triage and fix it here. `fetch` never creates, edits, or closes the issue — it only reads it.
 
@@ -36,7 +37,7 @@ After resolution, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
 - Ensure `.specify/bugs/<BUG_SLUG>/` exists (create it, including any missing parents, if necessary).
 - If `BUG_DIR/issue.md` already exists, do **not** re-fetch silently: report the existing link and stop (unless the user explicitly asks to refresh). If they ask to refresh, overwrite `issue.md`; never clobber `assessment.md`/`fix.md`/`test.md` — only regenerate `assessment.md` if it is missing or with explicit confirmation.
-- Detect GitHub context (same as `/skill:speckit-bug-issue`):
+- Detect GitHub context (same as `/speckit-bug-issue`):
   - `git rev-parse --is-inside-work-tree 2>/dev/null` to confirm a repository.
   - `git config --get remote.origin.url` to read the remote; parse `owner`/`repo` (HTTPS `https://github.com/<owner>/<repo>.git` or SSH `git@github.com:<owner>/<repo>.git`). Only proceed with a live fetch when the remote points to `github.com`.
   - `command -v gh >/dev/null 2>&1` and `gh auth status` to confirm the CLI and auth. If `gh`/GitHub remote/auth is unavailable, skip the live fetch and write a draft (see Graceful Degradation).
@@ -85,7 +86,7 @@ After resolution, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
    - Note any `severity:*` label as the severity; otherwise `unknown`.
 
 4. **Seed the assessment draft**
-   - Write `BUG_DIR/assessment.md` **only if it does not already exist**. If it exists, leave it and note that the user can run `/skill:speckit-bug-assess` to refine the triage:
+   - Write `BUG_DIR/assessment.md` **only if it does not already exist**. If it exists, leave it and note that the user can run `/speckit-bug-assess` to refine the triage:
      ```markdown
      # Bug Assessment: <short title>
 
@@ -109,7 +110,7 @@ After resolution, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
      ## Suspected Code Paths
 
-     [NEEDS CLARIFICATION — run /skill:speckit-bug-assess to locate the code, or fill in manually.]
+     [NEEDS CLARIFICATION — run /speckit-bug-assess to locate the code, or fill in manually.]
 
      ## Root Cause Hypothesis
 
@@ -117,7 +118,7 @@ After resolution, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
      ## Proposed Remediation
 
-     [NEEDS CLARIFICATION — run /skill:speckit-bug-assess to propose a fix, or apply a fix directly with /skill:speckit-bug-fix.]
+     [NEEDS CLARIFICATION — run /speckit-bug-assess to propose a fix, or apply a fix directly with /speckit-bug-fix.]
 
      ## Risks & Considerations
 
@@ -127,7 +128,7 @@ After resolution, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
      - [NEEDS CLARIFICATION: …]
      ```
-   - This scaffold lets `/skill:speckit-bug-fix` and `/skill:speckit-bug-test` run. The user can refine it by editing directly or by running `/skill:speckit-bug-assess` (which asks before overwriting the existing `assessment.md`).
+   - This scaffold lets `/speckit-bug-fix` and `/speckit-bug-test` run. The user can refine it by editing directly or by running `/speckit-bug-assess` (which asks before overwriting the existing `assessment.md`).
 
 5. **Graceful Degradation (no live fetch)**
    - When `gh`/GitHub remote/auth is unavailable, instead write `BUG_DIR/issue-draft.md` containing:
@@ -139,9 +140,9 @@ After resolution, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
    - The slug and the issue URL (or the draft path).
    - The issue state (`open`/`closed`) and severity (if known) — flag `closed` explicitly so the user knows.
    - The next suggested steps, in order:
-     - `/skill:speckit-bug-assess slug=<BUG_SLUG>` (refine the triage draft into a full assessment) — optional.
-     - `/skill:speckit-bug-fix slug=<BUG_SLUG>` (apply the fix; add `--branch` or `--worktree` to isolate).
-     - Then: `/skill:speckit-bug-pr slug=<BUG_SLUG>` (open a PR linking the issue; reuses `Closes #<number>` from `issue.md`).
+     - `/speckit-bug-assess slug=<BUG_SLUG>` (refine the triage draft into a full assessment) — optional.
+     - `/speckit-bug-fix slug=<BUG_SLUG>` (apply the fix; add `--branch` or `--worktree` to isolate).
+     - Then: `/speckit-bug-pr slug=<BUG_SLUG>` (open a PR linking the issue; reuses `Closes #<number>` from `issue.md`).
 
 ## Guardrails
 

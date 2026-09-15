@@ -244,29 +244,21 @@ get_invoke_separator() {
 
     local integration_json="$repo_root/.specify/integration.json"
     local separator="."
-    local parsed=0
+    local parsed_with_jq=0
 
     if [[ -f "$integration_json" ]]; then
-        # Try parsers in order (jq -> python3 -> awk), falling through on
-        # failure. Selection is by *parse success*, not mere availability: on
-        # Windows `python3` commonly resolves to the Microsoft Store App
-        # Execution Alias stub, which passes `command -v` but fails at runtime
-        # (exit 49). An availability-gated branch would pick python3, swallow
-        # its failure, and — because this function historically had no text
-        # fallback — silently return "." even for `-`-separator integrations
-        # (e.g. forge, cline), yielding wrong command hints (issue #3304).
         if command -v jq >/dev/null 2>&1; then
             local jq_separator
             if jq_separator=$(jq -r '(.default_integration // .integration // "") as $k | if $k == "" then "." else (.integration_settings[$k].invoke_separator // ".") end' "$integration_json" 2>/dev/null); then
+                parsed_with_jq=1
                 case "$jq_separator" in
-                    "."|"-") separator="$jq_separator"; parsed=1 ;;
+                    "."|"-") separator="$jq_separator" ;;
                 esac
             fi
         fi
 
-        if [[ "$parsed" -eq 0 ]] && command -v python3 >/dev/null 2>&1; then
-            local py_separator
-            if py_separator=$(python3 - "$integration_json" <<'PY' 2>/dev/null
+        if [[ "$parsed_with_jq" -eq 0 ]] && command -v python3 >/dev/null 2>&1; then
+            if separator=$(python3 - "$integration_json" <<'PY' 2>/dev/null
 import json
 import sys
 
@@ -282,63 +274,16 @@ try:
             separator = entry["invoke_separator"]
     print(separator)
 except Exception:
-    sys.exit(1)
+    print(".")
 PY
 ); then
-                case "$py_separator" in
-                    "."|"-") separator="$py_separator"; parsed=1 ;;
+                case "$separator" in
+                    "."|"-") ;;
+                    *) separator="." ;;
                 esac
+            else
+                separator="."
             fi
-        fi
-
-        if [[ "$parsed" -eq 0 ]]; then
-            # Last-resort text fallback for environments with neither jq nor a
-            # working python3 (e.g. stock Windows + Git Bash). Reads the active
-            # integration key (default_integration, else integration) and its
-            # invoke_separator from within the integration_settings object.
-            # Handles both pretty-printed (the written form) and compact JSON.
-            # Accumulate all lines into one buffer in END rather than using
-            # gawk-only whole-file slurp (RS="^$"), so this stays portable to
-            # the BSD awk on macOS.
-            local awk_separator
-            awk_separator=$(awk '
-                function keyval(d, name,   v) {
-                    if (match(d, "\"" name "\"[ \t\r\n]*:[ \t\r\n]*\"[^\"]*\"")) {
-                        v=substr(d,RSTART,RLENGTH); sub(/^.*:[ \t\r\n]*"/,"",v); sub(/"$/,"",v); return v
-                    }
-                    return ""
-                }
-                { doc = doc $0 "\n" }
-                END {
-                    key=keyval(doc,"default_integration"); if (key=="") key=keyval(doc,"integration")
-                    sep="."
-                    if (key!="") {
-                        settings=doc
-                        if (match(doc, /"integration_settings"[ \t\r\n]*:[ \t\r\n]*[{]/)) {
-                            settings=substr(doc, RSTART+RLENGTH-1)
-                        }
-                        if (match(settings, "\"" key "\"[ \t\r\n]*:[ \t\r\n]*[{]")) {
-                            start=RSTART+RLENGTH-1
-                            depth=0
-                            obj=""
-                            for (i=start; i<=length(settings); i++) {
-                                c=substr(settings,i,1)
-                                obj=obj c
-                                if (c=="{") depth++
-                                else if (c=="}") { depth--; if (depth==0) break }
-                            }
-                            if (match(obj, /"invoke_separator"[ \t\r\n]*:[ \t\r\n]*"[-.]"/)) {
-                                tok=substr(obj,RSTART,RLENGTH); s=substr(tok,length(tok)-1,1)
-                                if (s=="." || s=="-") sep=s
-                            }
-                        }
-                    }
-                    print sep
-                }
-            ' "$integration_json" 2>/dev/null)
-            case "$awk_separator" in
-                "."|"-") separator="$awk_separator" ;;
-            esac
         fi
     fi
 
@@ -364,7 +309,7 @@ format_speckit_command() {
     command_name="${command_name#speckit-}"
     command_name="${command_name//./$separator}"
 
-    printf '/skill:speckit%s%s\n' "$separator" "$command_name"
+    printf '/speckit%s%s\n' "$separator" "$command_name"
 }
 
 # Escape a string for safe embedding in a JSON value (fallback when jq is unavailable).

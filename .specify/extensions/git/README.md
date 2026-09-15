@@ -63,14 +63,6 @@ branch_template: ""
 # Example: "features/{app}" expands to "features/{app}/{number}-{slug}"
 branch_prefix: ""
 
-# Create a git worktree instead of just a feature branch. When true, the feature
-# script creates a worktree for the new branch (git worktree add -b ...), leaving
-# the primary checkout untouched so multiple features can be worked on in parallel.
-# When false (default), it creates and checks out the branch as before. Override
-# the computed path (`.worktrees/<branch>` inside the project) with the
-# SPECIFY_WORKTREE_PATH environment variable.
-create_worktree: false
-
 # Custom commit message for git init
 init_commit_message: "[Spec Kit] Initial commit"
 

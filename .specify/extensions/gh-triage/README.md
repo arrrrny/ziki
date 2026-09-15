@@ -42,6 +42,32 @@ repo's `release.yml` workflow (tag `gh-triage-v<version>`), or add this repo's
 /speckit.gh-triage.triage --dry-run      # preview labels, apply nothing
 ```
 
+## File a feature issue
+
+`/speckit.gh-triage.feature` creates a GitHub issue that describes a new feature,
+labels it with the configured feature label (default `enhancement`), and — only
+when you ask — turns it into a spec via `speckit.specify`.
+
+```
+/speckit.gh-triage.feature Add dark mode to the settings screen
+/speckit.gh-triage.feature --title "Add dark mode" --body "Users want a dark theme in settings"
+/speckit.gh-triage.feature --repo owner/repo Add export to CSV
+/speckit.gh-triage.feature --specify Add dark mode to settings   # file issue AND run speckit.specify
+```
+
+- `--title` / `--body` set the issue title and description; without them the
+  first line of your text is the title and the rest is the body.
+- `--repo` files the issue in a specific `owner/repo` (else `repo:` from config,
+  else the current git remote).
+- The spec step is **off by default**. It runs automatically when either:
+  - you pass `--specify` (forces it on for that one run), or
+  - `auto_specify: true` is set in `gh-triage-config.yml` (always on).
+  When it runs, the command automatically invokes `speckit.specify` to write a
+  spec under `specs/` quoting the new issue URL. With both off, the command only
+  files the issue and stops — you run `speckit.specify` yourself later.
+- The configured feature label is applied only when it already exists in the
+  target repo; a missing label is skipped with a warning, never force-created.
+
 ## How labeling works (the important part)
 
 Labeling is **opt-out, not opt-in** — it happens by default. After
@@ -86,7 +112,8 @@ that the repo does not have is skipped with a warning, never force-created. Use
 | --- | --- |
 | `extension.yml` | Manifest. Declares the dependency on the `bug` extension + `speckit.specify`, and the `gh-triage-config.yml` config. |
 | `commands/speckit.gh-triage.triage.md` | Agent command: orchestrates fetch/label (via the engine) then routes each issue. |
-| `scripts/bash/gh-triage.sh` | Dependency-light engine: fetch, classify, label. `jq` + `gh` only (no `yq`/`PyYAML`). |
+| `commands/speckit.gh-triage.feature.md` | Agent command: file a feature issue (via the engine) and optionally auto-run `speckit.specify`. |
+| `scripts/bash/gh-triage.sh` | Dependency-light engine: fetch, classify, label, and (in `feature` mode) create a feature issue. `jq` + `gh` only (no `yq`/`PyYAML`). |
 | `config-template.yml` | Default config, deployed as `gh-triage-config.yml`. |
 
 ## Behavior: safe by default
@@ -110,5 +137,6 @@ gh-triage.)
 ## Requirements
 
 - `gh` CLI, authenticated (`gh auth login`).
+- `jq` — the triage engine parses every GitHub JSON payload with it.
 - The `bug` extension installed (provides `speckit.bug.*`).
 - spec-kit >= 0.9.0.

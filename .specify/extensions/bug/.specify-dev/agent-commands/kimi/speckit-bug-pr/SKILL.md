@@ -9,7 +9,7 @@ metadata:
 
 # Open Fix Pull Request
 
-Open a GitHub pull request for the fix recorded by `/skill:speckit-bug-fix`. This command reads `.specify/bugs/<slug>/fix.md` (and `issue.md` if the bug was reported) and creates a PR via the `gh` CLI from the current branch, linking the issue. If `gh` or a GitHub remote is unavailable, it writes a ready-to-paste PR draft instead.
+Open a GitHub pull request for the fix recorded by `/speckit-bug-fix`. This command reads `.specify/bugs/<slug>/fix.md` (and `issue.md` if the bug was reported) and creates a PR via the `gh` CLI from the current branch, linking the issue. If `gh` or a GitHub remote is unavailable, it writes a ready-to-paste PR draft instead.
 
 > This command is the natural follow-up when `bug.fix` was run with `--branch` / `--worktree`: the current branch is the fix branch (e.g. `fix/<slug>`) and the PR opens from it.
 
@@ -30,7 +30,7 @@ Accept any of:
 Resolve `BUG_SLUG` in this order, stopping at the first match:
 
 1. **Explicit user input** — a slug passed in `$ARGUMENTS` (any of the forms above).
-2. **Conversation context** — if the current session has just run `/skill:speckit-bug-fix` (or `bug.issue`), the slug it reported is the working slug. Reuse it without re-prompting.
+2. **Conversation context** — if the current session has just run `/speckit-bug-fix` (or `bug.issue`), the slug it reported is the working slug. Reuse it without re-prompting.
 3. **Single candidate on disk** — list `.specify/bugs/*/fix.md`. If exactly one bug has a `fix.md`, use it.
 4. **Disambiguate**:
    - **Interactive mode**: ask the user which bug to open a PR for and list the candidates.
@@ -40,7 +40,7 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
 ## Prerequisites
 
-- `BUG_DIR/fix.md` MUST exist. If it does not, stop and instruct the user to run `/skill:speckit-bug-fix` first.
+- `BUG_DIR/fix.md` MUST exist. If it does not, stop and instruct the user to run `/speckit-bug-fix` first.
 - Confirm the current branch is the fix branch (created by `bug.fix --branch`, or whatever branch holds the change). If the working tree is on `main`/`master` with uncommitted changes, warn the user and ask which branch to open the PR from before continuing.
 - Detect GitHub context (same as `bug.issue`):
   - `git rev-parse --is-inside-work-tree` and `git config --get remote.origin.url` to parse `owner`/`repo`; only proceed live when the remote is `github.com`.
@@ -89,7 +89,7 @@ Once resolved, set `BUG_SLUG` and `BUG_DIR = .specify/bugs/<BUG_SLUG>`.
 
 6. **Report back** with:
    - The slug, the PR URL (or draft path), and the branch it opened from.
-   - The next suggested step: `/skill:speckit-bug-test slug=<BUG_SLUG>` (to validate once the PR is merged or on the branch).
+   - The next suggested step: `/speckit-bug-test slug=<BUG_SLUG>` (to validate once the PR is merged or on the branch).
 
 ## Guardrails
 

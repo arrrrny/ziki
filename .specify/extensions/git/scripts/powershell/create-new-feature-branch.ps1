@@ -391,31 +391,6 @@ function Get-FeatureNumberFromBranchName {
     return $BranchName
 }
 
-# Append `.worktrees/` to the repo .gitignore so freshly created worktrees
-# (nested git checkouts) are never accidentally committed. Idempotent.
-function Protect-WorktreesGitignore {
-    $gi = Join-Path $repoRoot ".gitignore"
-    if (-not (Test-Path -LiteralPath $gi -PathType Leaf)) {
-        Set-Content -Path $gi -Value ".worktrees/" -NoNewline
-        return
-    }
-    $lines = Get-Content -LiteralPath $gi
-    if ($lines -contains ".worktrees/") { return }
-    Add-Content -Path $gi -Value ".worktrees/"
-}
-
-# Copy the (untracked / gitignored) .specify scaffolding into the new worktree.
-# `git worktree add` only checks out tracked files, so .specify is absent from
-# the fresh checkout; the agent must run Spec Kit commands from inside it.
-# Copies only when missing so re-runs are idempotent.
-function Copy-SpecifyIntoWorktree {
-    $src = Join-Path $repoRoot ".specify"
-    $dst = Join-Path $worktreePath ".specify"
-    if ((Test-Path -LiteralPath $src -PathType Container) -and -not (Test-Path -LiteralPath $dst)) {
-        Copy-Item -Path $src -Destination $dst -Recurse -Force
-    }
-}
-
 function Get-Utf8ByteCount {
     param([string]$Value)
     return [System.Text.Encoding]::UTF8.GetByteCount($Value)
@@ -425,12 +400,6 @@ $authorToken = Get-GitAuthorToken
 $appToken = Get-AppToken
 $branchTemplate = Resolve-BranchTemplate
 Assert-BranchTemplateValid -Template $branchTemplate
-
-$createWorktreeVal = Read-GitConfigValue -Key 'create_worktree'
-$createWorktree = $false
-if ($createWorktreeVal -and ($createWorktreeVal.Trim().ToLower() -match '^(true|1|yes|on)$')) {
-    $createWorktree = $true
-}
 
 function Get-BranchName {
     param([string]$Description)
@@ -537,61 +506,8 @@ if ((Get-Utf8ByteCount -Value $branchName) -gt $maxBranchLength) {
     Write-Warning "[specify] Truncated to: $branchName ($(Get-Utf8ByteCount -Value $branchName) bytes)"
 }
 
-if ($env:SPECIFY_WORKTREE_PATH) {
-    $worktreePath = $env:SPECIFY_WORKTREE_PATH
-} else {
-    $worktreePath = Join-Path $repoRoot ".worktrees" $branchName
-}
-
 if (-not $DryRun) {
-    if ($createWorktree -and $hasGit) {
-        # Create a worktree (and feature branch) instead of a branch only,
-        # leaving the primary checkout untouched for parallel feature work.
-        $branchExists = [bool](git branch --list $branchName 2>$null)
-        $worktreeFailed = $false
-        $branchCreateError = ''
-        if ($branchExists -and -not $AllowExistingBranch) {
-            if ($Timestamp) {
-                Write-Error "Error: Branch '$branchName' already exists. Rerun to get a new timestamp or use a different -ShortName."
-            } else {
-                Write-Error "Error: Branch '$branchName' already exists. Please use a different feature name or specify a different number with -Number."
-            }
-            exit 1
-        }
-        try {
-            if ($branchExists) {
-                $branchCreateError = git worktree add -q "$worktreePath" $branchName 2>&1 | Out-String
-            } else {
-                $branchCreateError = git worktree add -q -b $branchName "$worktreePath" 2>&1 | Out-String
-            }
-            if ($LASTEXITCODE -ne 0) { $worktreeFailed = $true }
-        } catch {
-            $branchCreateError = $_.Exception.Message
-            $worktreeFailed = $true
-        }
-        if ($worktreeFailed) {
-            $registered = $false
-            try {
-                $wtList = git worktree list --porcelain 2>$null
-                if ($wtList -split "`n" | Where-Object { $_ -eq "worktree $worktreePath" }) {
-                    $registered = $true
-                }
-            } catch {}
-            if (-not $registered) {
-                if ($branchCreateError) {
-                    Write-Error "Error: Failed to create git worktree '$worktreePath'.`n$($branchCreateError.Trim())"
-                } else {
-                    Write-Error "Error: Failed to create git worktree '$worktreePath'. Please check your git configuration and try again."
-                }
-                exit 1
-            }
-            Protect-WorktreesGitignore
-            Copy-SpecifyIntoWorktree
-        } else {
-            Protect-WorktreesGitignore
-            Copy-SpecifyIntoWorktree
-        }
-    } elseif ($hasGit) {
+    if ($hasGit) {
         $branchCreated = $false
         $branchCreateError = ''
         try {
@@ -662,11 +578,7 @@ if ($Json) {
     }
     # $hasGit is computed for branch-creation logic only; it is intentionally not
     # emitted so this output contract matches the bash twin: BRANCH_NAME and
-    # FEATURE_NUM, plus WORKTREE_PATH (when create_worktree is enabled) and
-    # DRY_RUN (on dry runs).
-    if ($createWorktree) {
-        $obj | Add-Member -NotePropertyName 'WORKTREE_PATH' -NotePropertyValue $worktreePath
-    }
+    # FEATURE_NUM, plus DRY_RUN (added just below) on dry runs.
     if ($DryRun) {
         $obj | Add-Member -NotePropertyName 'DRY_RUN' -NotePropertyValue $true
     }
@@ -674,9 +586,6 @@ if ($Json) {
 } else {
     Write-Output "BRANCH_NAME: $branchName"
     Write-Output "FEATURE_NUM: $featureNum"
-    if ($createWorktree) {
-        Write-Output "WORKTREE_PATH: $worktreePath"
-    }
     if (-not $DryRun) {
         Write-Output "# To persist in your shell: $featureAssignment"
     }

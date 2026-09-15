@@ -2,9 +2,9 @@
   "schema_version": "1.0",
   "extensions": {
     "bug": {
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "local",
-      "manifest_hash": "sha256:7d168a3b0d409129022c600624d798ec2be4a72528ca8b5ba6e753e62fe5897a",
+      "manifest_hash": "sha256:c5b1a445c4a4cd0359885d0b1aeedebf6e7cf8dbd79cc3f5a231e34b36012c3e",
       "enabled": true,
       "priority": 10,
       "registered_commands": {
@@ -18,12 +18,12 @@
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-26T14:35:36.766021+00:00"
+      "installed_at": "2026-09-15T19:26:21.255149+00:00"
     },
     "git": {
       "version": "1.0.0",
       "source": "local",
-      "manifest_hash": "sha256:47ea781a2c984fb3fe4c2627aae17ac22db2d07f99ada3301cf2960afc4c3d4f",
+      "manifest_hash": "sha256:89711dec9716473fba4afc54f7224bcb28ebd3c55fb5aaa30df854ab02b07a75",
       "enabled": true,
       "priority": 10,
       "registered_commands": {
@@ -36,21 +36,22 @@
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-26T14:35:40.796583+00:00"
+      "installed_at": "2026-09-15T19:26:24.142208+00:00"
     },
     "gh-triage": {
-      "version": "1.0.0",
+      "version": "1.1.1",
       "source": "local",
-      "manifest_hash": "sha256:50f974a4c951ca1645dbf07bde780b9daa66e014c90e856cea7c413ae93902eb",
+      "manifest_hash": "sha256:3d4dfd2137d230e05e89f37bcf156ace765d730d042c83e5bc65ddfb87b99393",
       "enabled": true,
       "priority": 10,
       "registered_commands": {
         "kimi": [
-          "speckit.gh-triage.triage"
+          "speckit.gh-triage.triage",
+          "speckit.gh-triage.feature"
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-26T14:35:44.953869+00:00"
+      "installed_at": "2026-09-15T19:26:27.208833+00:00"
     },
     "gym": {
       "version": "1.0.0",
@@ -68,7 +69,7 @@
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-26T14:35:49.024350+00:00"
+      "installed_at": "2026-09-15T19:26:30.116665+00:00"
     },
     "tdd": {
       "version": "1.1.2",
@@ -85,7 +86,7 @@
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-26T14:35:54.050492+00:00"
+      "installed_at": "2026-09-15T19:26:33.000179+00:00"
     },
     "chore": {
       "version": "1.0.0",
@@ -103,7 +104,7 @@
         ]
       },
       "registered_skills": [],
-      "installed_at": "2026-08-26T14:35:59.894429+00:00"
+      "installed_at": "2026-09-15T19:26:35.781964+00:00"
     }
   }
 }

@@ -1,6 +1,7 @@
 ---
 name: speckit-chore-assess
-description: Scope a maintenance chore against the codebase and the project constitution, and write an assessment
+description: Scope a maintenance chore against the codebase and the project constitution,
+  and write an assessment
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -13,7 +14,7 @@ Scope a maintenance chore against the current codebase and the project
 constitution: understand what needs to change, locate the affected paths, judge
 scope and risk, and propose an approach. The output is a single assessment file at
 `.specify/chores/<slug>/assessment.md` that downstream commands
-(`/skill:speckit-chore-implement`, `/skill:speckit-chore-pr`) consume.
+(`/speckit-chore-implement`, `/speckit-chore-pr`) consume.
 
 A **chore** is work that is neither a bug (something broken) nor a feature (new
 user-facing capability): refactors, dependency bumps, asset swaps, config
@@ -114,7 +115,7 @@ Do not attempt to validate the URL by issuing a preflight `HEAD` (or any other) 
 
 6. **Propose an approach**
    - Outline the preferred approach and, if non-obvious, one or two alternatives with trade-offs.
-   - Identify files/dirs to change and the shape of the change (without doing the work yet — that is `/skill:speckit-chore-implement`'s job).
+   - Identify files/dirs to change and the shape of the change (without doing the work yet — that is `/speckit-chore-implement`'s job).
    - Call out verification that should exist or be run to prove the chore landed (build, lint, existing tests, a visual check for asset swaps, etc.).
    - Flag risks: API breakage, migrations, performance, security, observability, blast radius.
 
@@ -181,17 +182,17 @@ By default, `assess` only writes a **local** assessment; it does **not** file a 
 2. **Config opt-in**: read `.specify/extensions/chore/chore-config.yml` (scaffolded at install). If it exists and `auto_create_issue` is `true` (or `1` / `yes` / `on`), file the issue now — the user enabled this explicitly, so no further confirmation is required.
 3. **Otherwise**: do not file it; only **suggest** the issue step in the report-back below.
 
-When filing, perform the same procedure as `/skill:speckit-chore-issue` for this slug: read the assessment you just wrote, create the GitHub issue via `gh`, and record `CHORE_DIR/issue.md`. If `gh` / GitHub remote / auth is unavailable, write `CHORE_DIR/issue-draft.md` and note it — do not error.
+When filing, perform the same procedure as `/speckit-chore-issue` for this slug: read the assessment you just wrote, create the GitHub issue via `gh`, and record `CHORE_DIR/issue.md`. If `gh` / GitHub remote / auth is unavailable, write `CHORE_DIR/issue-draft.md` and note it — do not error.
 
 8. **Report back** with:
    - The slug used and whether it was user-provided, asked-for, or auto-generated. State it on its own line (e.g. `Slug: <CHORE_SLUG>`) so it is easy to spot — downstream commands in the same session may reuse it from context without re-prompting.
    - The path `.specify/chores/<CHORE_SLUG>/assessment.md`.
    - The verdict and size.
-   - A one-line clarification: `assess` = local scoping (this file); "report" = the GitHub issue created by `/skill:speckit-chore-issue`.
-   - A note that if the chore is **already** tracked as a GitHub issue you want to work on, you can skip pasting it here and instead load it with `/skill:speckit-chore-fetch` (by issue number / URL / `owner/repo#n`), which records `issue.md` and seeds this assessment for you.
+   - A one-line clarification: `assess` = local scoping (this file); "report" = the GitHub issue created by `/speckit-chore-issue`.
+   - A note that if the chore is **already** tracked as a GitHub issue you want to work on, you can skip pasting it here and instead load it with `/speckit-chore-fetch` (by issue number / URL / `owner/repo#n`), which records `issue.md` and seeds this assessment for you.
    - The next suggested steps, in order:
-     - If the issue was NOT yet filed: `/skill:speckit-chore-issue slug=<CHORE_SLUG>` (file the GitHub issue).
-     - Then: `/skill:speckit-chore-implement slug=<CHORE_SLUG>` (apply the chore; add `--branch` or `--worktree` to isolate it on its own branch).
+     - If the issue was NOT yet filed: `/speckit-chore-issue slug=<CHORE_SLUG>` (file the GitHub issue).
+     - Then: `/speckit-chore-implement slug=<CHORE_SLUG>` (apply the chore; add `--branch` or `--worktree` to isolate it on its own branch).
 
 ## Guardrails
 

@@ -1,6 +1,7 @@
 ---
 name: speckit-bug-assess
-description: Assess a bug report (pasted text or URL) against the codebase and produce an assessment with possible remediation
+description: Assess a bug report (pasted text or URL) against the codebase and produce
+  an assessment with possible remediation
 compatibility: Requires spec-kit project structure with .specify/ directory
 metadata:
   author: github-spec-kit
@@ -9,7 +10,7 @@ metadata:
 
 # Assess Bug
 
-Triage a bug report against the current codebase: understand the symptom, locate the suspected root cause, judge severity, and propose a remediation. The output is a single assessment file at `.specify/bugs/<slug>/assessment.md` that downstream commands (`/skill:speckit-bug-fix`, `/skill:speckit-bug-test`) consume.
+Triage a bug report against the current codebase: understand the symptom, locate the suspected root cause, judge severity, and propose a remediation. The output is a single assessment file at `.specify/bugs/<slug>/assessment.md` that downstream commands (`/speckit-bug-fix`, `/speckit-bug-test`) consume.
 
 ## User Input
 
@@ -99,7 +100,7 @@ Do not attempt to validate the URL by issuing a preflight `HEAD` (or any other) 
 
 5. **Propose a remediation**
    - Outline one preferred fix and, if non-obvious, one or two alternatives with trade-offs.
-   - Identify files to change and the shape of the change (without writing the patch yet — that is `/skill:speckit-bug-fix`'s job).
+   - Identify files to change and the shape of the change (without writing the patch yet — that is `/speckit-bug-fix`'s job).
    - Call out tests that should exist or be added to lock the fix in.
    - Flag risks: API breakage, migrations, performance, security, observability.
 
@@ -173,17 +174,17 @@ By default, `assess` only writes a **local** assessment; it does **not** file a 
 2. **Config opt-in**: read `.specify/extensions/bug/bug-config.yml` (scaffolded at install). If it exists and `auto_create_issue` is `true` (or `1` / `yes` / `on`), file the issue now — the user enabled this explicitly, so no further confirmation is required.
 3. **Otherwise**: do not file it; only **suggest** the issue step in the report-back below.
 
-When filing, perform the same procedure as `/skill:speckit-bug-issue` for this slug: read the assessment you just wrote, create the GitHub issue via `gh`, and record `BUG_DIR/issue.md`. If `gh` / GitHub remote / auth is unavailable, write `BUG_DIR/issue-draft.md` and note it — do not error.
+When filing, perform the same procedure as `/speckit-bug-issue` for this slug: read the assessment you just wrote, create the GitHub issue via `gh`, and record `BUG_DIR/issue.md`. If `gh` / GitHub remote / auth is unavailable, write `BUG_DIR/issue-draft.md` and note it — do not error.
 
 7. **Report back** with:
    - The slug used and whether it was user-provided, asked-for, or auto-generated. State it on its own line (e.g. `Slug: <BUG_SLUG>`) so it is easy to spot — downstream commands in the same session may reuse it from context without re-prompting.
    - The path `.specify/bugs/<BUG_SLUG>/assessment.md`.
    - The verdict and severity.
-   - A one-line clarification: `assess` = local triage (this file); "report" = the GitHub issue created by `/skill:speckit-bug-issue`.
-   - A note that if the bug is **already** tracked as a GitHub issue you want to work on, you can skip pasting it here and instead load it with `/skill:speckit-bug-fetch` (by issue number / URL / `owner/repo#n`), which records `issue.md` and seeds this assessment for you.
+   - A one-line clarification: `assess` = local triage (this file); "report" = the GitHub issue created by `/speckit-bug-issue`.
+   - A note that if the bug is **already** tracked as a GitHub issue you want to work on, you can skip pasting it here and instead load it with `/speckit-bug-fetch` (by issue number / URL / `owner/repo#n`), which records `issue.md` and seeds this assessment for you.
    - The next suggested steps, in order:
-     - If the issue was NOT yet filed: `/skill:speckit-bug-issue slug=<BUG_SLUG>` (file the GitHub issue).
-     - Then: `/skill:speckit-bug-fix slug=<BUG_SLUG>` (apply the remediation; add `--branch` or `--worktree` to isolate the fix on its own branch).
+     - If the issue was NOT yet filed: `/speckit-bug-issue slug=<BUG_SLUG>` (file the GitHub issue).
+     - Then: `/speckit-bug-fix slug=<BUG_SLUG>` (apply the remediation; add `--branch` or `--worktree` to isolate the fix on its own branch).
 
 ## Guardrails
 
