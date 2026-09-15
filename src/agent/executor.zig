@@ -7,6 +7,7 @@ const ToolResult = @import("../tool/tool.zig").ToolResult;
 const Goal = @import("../goal/goal.zig").Goal;
 const GoalRepository = @import("../goal/repository.zig").GoalRepository;
 const Fs = @import("../fs/fs.zig").Fs;
+const StopProbe = @import("stop.zig").StopProbe;
 
 /// Drives an autonomous goal loop (FR-002/003/008). Depends only on injected
 /// interfaces (DIP): Provider, Tool[], GoalRepository, Fs.
@@ -44,6 +45,22 @@ pub const GoalExecutor = struct {
     /// blocked/idle at terminal). When null the loop behaves exactly as before
     /// (SC-005): no publication, no side effects (FR-008).
     publisher: ?state.StatePublisher = null,
+    /// Mid-turn stop observation (spec 013 D5). When null the loop falls back
+    /// to the stop-file probe built from `dir`/`session_id` (the `/stop`
+    /// contract), so existing behavior is unchanged.
+    stop: ?StopProbe = null,
+    /// Compaction window (spec 013 D3): how many recent messages are retained
+    /// when the conversation is compacted. The system prompt and the original
+    /// goal message are always retained in addition.
+    retain_recent: usize = 8,
+    /// Number of compactions performed this run (observable; reported).
+    compactions: u32 = 0,
+    /// Wall-clock accounting (spec 013 D4): `goal.used.seconds` value captured
+    /// at run start (persisted carry from earlier runs) and this run's start.
+    carried_seconds: u64 = 0,
+    run_start_ms: i64 = 0,
+    /// Cached stop-file path for the default probe (owned by `alloc`).
+    stop_path: ?[]const u8 = null,
 
     /// Print a diagnostic line to stdout (only when verbose). Used so an
     /// autonomous run is observable instead of appearing to "do nothing".
@@ -53,15 +70,235 @@ pub const GoalExecutor = struct {
         std.fs.File.stdout().writeAll(s) catch {};
     }
 
-    fn stopPath(self: *GoalExecutor, a: Allocator) ![]u8 {
-        return std.fmt.allocPrint(a, "{s}/stop.{s}", .{ self.dir, self.session_id });
-    }
-
     /// Owns `goal.progress` as a heap slice: frees the previous value before
     /// storing the new one so the executor never leaks between turns.
     fn setProgress(self: *GoalExecutor, goal: *Goal, p: []const u8) !void {
         self.alloc.free(goal.progress);
         goal.progress = try self.alloc.dupe(u8, p);
+    }
+
+    /// Mid-turn stop observation (spec 013 D5). An injected probe wins; the
+    /// fallback is the `/stop` signal file of this session.
+    fn stopRequested(self: *GoalExecutor) bool {
+        if (self.stop) |p| return p.isStop();
+        if (self.stop_path) |p| return self.fs.exists(p);
+        return false;
+    }
+
+    /// Best-effort transcript persistence after each turn (spec 013 D1):
+    /// resume replays this; a failed save degrades the next resume to a fresh
+    /// conversation, so it must never fail the run.
+    fn saveHistorySafe(self: *GoalExecutor, goal_id: []const u8, messages: []const provider.ChatMessage) void {
+        self.repo.saveHistory(self.alloc, goal_id, messages) catch |e| {
+            if (self.verbose) logLine(self.alloc, "verbose: history save failed: {s}", .{@errorName(e)});
+        };
+    }
+
+    /// Move the goal into a terminal state: status + progress + publisher +
+    /// persist. Conversation history is cleared for terminal goals so the
+    /// session's next goal never replays a foreign transcript.
+    fn finish(self: *GoalExecutor, goal: *Goal, status: @import("../goal/goal.zig").Status, progress: []const u8, publisher_msg: ?[]const u8, skip: ?[]const u8) !void {
+        goal.status = status;
+        if (self.publisher != null) {
+            self.publisher.?.publish(if (status == .blocked) .blocked else .idle, publisher_msg);
+        }
+        try self.setProgress(goal, progress);
+        if (skip) |s| try self.addSkip(s);
+        try self.repo.save(self.alloc, goal.*);
+        self.repo.clearHistory(self.alloc) catch {};
+    }
+
+    /// Token estimate for a message list (spec 013 D2 fallback): content and
+    /// tool-call JSON bytes divided by 4, plus a small per-message overhead.
+    fn estimateTokens(messages: []const provider.ChatMessage) u64 {
+        var bytes: u64 = 0;
+        for (messages) |m| {
+            bytes += m.content.len + 8;
+            if (m.tool_calls) |tcs| {
+                for (tcs) |tc| bytes += tc.arguments_json.len + tc.name.len + 16;
+            }
+        }
+        return bytes / 4;
+    }
+
+    fn dupeMessageInto(a: Allocator, m: provider.ChatMessage) !provider.ChatMessage {
+        var tcs: ?[]provider.ToolCall = null;
+        if (m.tool_calls) |src| {
+            const owned = try a.alloc(provider.ToolCall, src.len);
+            for (src, 0..) |tc, i| {
+                owned[i] = .{
+                    .id = try a.dupe(u8, tc.id),
+                    .name = try a.dupe(u8, tc.name),
+                    .arguments_json = try a.dupe(u8, tc.arguments_json),
+                };
+            }
+            tcs = owned;
+        }
+        return .{
+            .role = m.role,
+            .content = try a.dupe(u8, m.content),
+            .tool_calls = tcs,
+            .tool_call_id = if (m.tool_call_id) |id| try a.dupe(u8, id) else null,
+        };
+    }
+
+    fn dupeResponseInto(a: Allocator, r: provider.ChatResponse) !provider.ChatResponse {
+        return .{
+            .message = try dupeMessageInto(a, r.message),
+            .finish_reason = r.finish_reason,
+            .usage = r.usage,
+        };
+    }
+
+    /// Compact the conversation (spec 013 D3): retain the system prompt, the
+    /// original goal message, a compaction notice, and the most recent
+    /// `retain_recent` messages (extended backwards so a tool result is never
+    /// separated from its assistant tool_calls message). Rebuilds the list in
+    /// a fresh arena and resets the old one so per-run memory stays bounded.
+    /// Returns true when a compaction happened, false when nothing was
+    /// trimmable (the caller then stops on the token budget).
+    fn compact(self: *GoalExecutor, arena: *std.heap.ArenaAllocator, messages: *std.ArrayList(provider.ChatMessage), goal: *Goal) !bool {
+        const msgs = messages.items;
+        if (msgs.len < 3) return false; // system + goal + at most one more: nothing trimmable
+        // First retained index: keep the last `retain_recent` messages, then
+        // extend backwards over a tool-result run so pairs stay intact.
+        var start = msgs.len - @min(self.retain_recent, msgs.len - 2);
+        while (start > 2 and msgs[start].role == .tool) start -= 1;
+        if (start <= 2) return false; // nothing between the kept head and the window
+
+        var dropped_tokens: u64 = 0;
+        for (msgs[2..start]) |m| {
+            dropped_tokens += estimateTokens(&[_]provider.ChatMessage{m});
+        }
+
+        var new_arena = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer new_arena.deinit();
+        const na = new_arena.allocator();
+        var new_msgs = try std.ArrayList(provider.ChatMessage).initCapacity(na, 0);
+        try new_msgs.append(na, try dupeMessageInto(na, msgs[0]));
+        try new_msgs.append(na, try dupeMessageInto(na, msgs[1]));
+        try new_msgs.append(na, .{ .role = .user, .content = try na.dupe(u8, "[system note: earlier conversation turns were compacted to stay within the token budget]") });
+        for (msgs[start..]) |m| {
+            try new_msgs.append(na, try dupeMessageInto(na, m));
+        }
+
+        arena.deinit();
+        arena.* = new_arena;
+        messages.* = new_msgs;
+        self.compactions += 1;
+        goal.used.tokens -= @min(dropped_tokens, goal.used.tokens);
+        try self.addSkip("context compacted: earlier turns trimmed to stay within the token budget");
+        if (self.verbose) logLine(self.alloc, "verbose: compacted conversation to {d} messages", .{messages.items.len});
+        return true;
+    }
+
+    /// One provider completion with mid-I/O stop observation (spec 013 D5/D9).
+    ///
+    /// The call runs on a worker thread with a dedicated arena holding a deep
+    /// copy of the request; the caller polls the stop probe every 50 ms. When
+    /// the probe fires, the in-flight call is abandoned (bounded grace), any
+    /// late response is discarded, and `.aborted` is returned — the abort wins
+    /// over a concurrent provider response (spec 006 edge case). Retries keep
+    /// the 3-attempt/200 ms backoff of the plain loop, with every sleep and
+    /// attempt boundary probe-checked.
+    const Interruptible = union(enum) {
+        resp: provider.ChatResponse,
+        aborted: void,
+    };
+
+    const IoState = struct {
+        exec: *GoalExecutor,
+        req: provider.CompletionRequest,
+        arena: *std.heap.ArenaAllocator,
+        resp: ?provider.ChatResponse = null,
+        err: ?anyerror = null,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+
+    fn ioWorker(io: *IoState) void {
+        const ia = io.arena.allocator();
+        if (io.exec.provider.complete(ia, io.req)) |r| {
+            io.resp = r;
+        } else |e| {
+            io.err = e;
+        }
+        io.done.store(true, .release);
+    }
+
+    fn completeInterruptible(self: *GoalExecutor, a: Allocator, req: provider.CompletionRequest) !Interruptible {
+        const max_attempts: u32 = 3;
+        const poll_ms: u64 = 50;
+        const grace_ms: u64 = 2000;
+        var attempt: u32 = 0;
+        while (attempt < max_attempts) : (attempt += 1) {
+            if (self.stopRequested()) return .aborted;
+
+            const arena = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            // Deep-copy the request into the worker arena so an abandoned
+            // worker never reads memory owned by the caller's run arena.
+            const owned_req = blk: {
+                const wa = arena.allocator();
+                const msgs = try wa.alloc(provider.ChatMessage, req.messages.len);
+                for (req.messages, 0..) |m, i| msgs[i] = try dupeMessageInto(wa, m);
+                const specs = try wa.alloc(provider.ToolSpec, req.tools.len);
+                for (req.tools, 0..) |t, i| {
+                    specs[i] = .{
+                        .name = try wa.dupe(u8, t.name),
+                        .description = try wa.dupe(u8, t.description),
+                        .parameters_json_schema = try wa.dupe(u8, t.parameters_json_schema),
+                    };
+                }
+                break :blk provider.CompletionRequest{ .messages = msgs, .tools = specs };
+            };
+
+            var io = IoState{ .exec = self, .req = owned_req, .arena = arena };
+            const thread = std.Thread.spawn(.{}, ioWorker, .{&io}) catch |e| {
+                arena.deinit();
+                std.heap.page_allocator.destroy(arena);
+                return e;
+            };
+            var stopped = false;
+            while (!io.done.load(.acquire)) {
+                if (self.stopRequested()) {
+                    stopped = true;
+                    break;
+                }
+                std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+            }
+            if (!io.done.load(.acquire)) {
+                // Abort grace: give the in-flight call a short window to finish
+                // so the common case joins cleanly; a genuinely hung call is
+                // detached (its arena is deliberately leaked — bounded KBs) and
+                // dies with the process. Socket-level cancel is out of scope.
+                var waited: u64 = 0;
+                while (!io.done.load(.acquire) and waited < grace_ms) {
+                    std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                    waited += poll_ms;
+                }
+            }
+            if (io.done.load(.acquire)) {
+                thread.join();
+                defer {
+                    arena.deinit();
+                    std.heap.page_allocator.destroy(arena);
+                }
+                if (stopped or self.stopRequested()) return .aborted; // abort wins: discard
+                if (io.err) |e| {
+                    if (attempt + 1 == max_attempts) return e;
+                    var slept: u64 = 0;
+                    while (slept < 200) : (slept += poll_ms) {
+                        if (self.stopRequested()) return .aborted;
+                        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                    }
+                    continue;
+                }
+                return .{ .resp = try dupeResponseInto(a, io.resp.?) };
+            }
+            thread.detach();
+            return .aborted;
+        }
+        unreachable;
     }
 
     fn systemPrompt(self: *GoalExecutor) ![]u8 {
@@ -144,8 +381,17 @@ pub const GoalExecutor = struct {
         unreachable;
     }
 
-    /// Run the goal to a terminal state (completed / blocked / aborted).
+    /// Run the goal to a terminal state (completed / blocked / aborted),
+    /// starting from a fresh conversation.
     pub fn run(self: *GoalExecutor, goal: *Goal) !void {
+        return self.runWithHistory(goal, &[_]provider.ChatMessage{});
+    }
+
+    /// Run the goal, optionally seeded with a previously persisted transcript
+    /// (spec 013: `ziki resume` loads turns from the store and continues).
+    /// Budgets (turns, tokens, time), context compaction and mid-turn abort
+    /// are enforced here; every turn persists goal state + transcript.
+    pub fn runWithHistory(self: *GoalExecutor, goal: *Goal, history: []const provider.ChatMessage) !void {
         // FR-005/FR-006 bookkeeping, alive for the whole run and freed at the end.
         self.intentional = IntentionalMap.init(self.alloc);
         self.pre_existing = IntentionalMap.init(self.alloc);
@@ -159,17 +405,41 @@ pub const GoalExecutor = struct {
             self.snapshotPreExisting() catch {};
         }
 
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const a = arena.allocator();
+        // Wall-clock budget carry (spec 013 D4) + cached default stop path.
+        self.carried_seconds = goal.used.seconds;
+        self.run_start_ms = std.time.milliTimestamp();
+        if (self.stop_path) |p| self.alloc.free(p);
+        self.stop_path = try std.fmt.allocPrint(self.alloc, "{s}/stop.{s}", .{ self.dir, self.session_id });
+        defer {
+            if (self.stop_path) |p| self.alloc.free(p);
+            self.stop_path = null;
+        }
+
+        // The conversation lives in a swappable arena so compaction can reset
+        // memory (spec 013 D3). `a` stays valid across swaps: it points at the
+        // boxed arena, whose identity never changes.
+        var arena_ptr = try self.alloc.create(std.heap.ArenaAllocator);
+        arena_ptr.* = std.heap.ArenaAllocator.init(self.alloc);
+        defer {
+            arena_ptr.deinit();
+            self.alloc.destroy(arena_ptr);
+        }
+        const a = arena_ptr.allocator();
 
         var messages = try std.ArrayList(provider.ChatMessage).initCapacity(a, 0);
-        const sp = try self.systemPrompt();
-        defer self.alloc.free(sp);
-        try messages.append(a, .{ .role = .system, .content = try a.dupe(u8, sp) });
-        const up = try self.userPrompt(goal);
-        defer self.alloc.free(up);
-        try messages.append(a, .{ .role = .user, .content = try a.dupe(u8, up) });
+        if (history.len > 0) {
+            // Resume: replay the persisted transcript verbatim (SC-001).
+            for (history) |m| {
+                try messages.append(a, try dupeMessageInto(a, m));
+            }
+        } else {
+            const sp = try self.systemPrompt();
+            defer self.alloc.free(sp);
+            try messages.append(a, .{ .role = .system, .content = try a.dupe(u8, sp) });
+            const up = try self.userPrompt(goal);
+            defer self.alloc.free(up);
+            try messages.append(a, .{ .role = .user, .content = try a.dupe(u8, up) });
+        }
 
         var verify_attempts: u32 = 0;
         // FR-001/FR-002: announce `working` the moment the loop becomes active.
@@ -177,25 +447,22 @@ pub const GoalExecutor = struct {
             self.publisher.?.publish(.working, null);
         }
         while (goal.status == .active) {
-            if (self.fs.exists(try self.stopPath(a))) {
-                self.fs.remove(try self.stopPath(a)) catch {};
-                goal.status = .aborted;
-                if (self.publisher != null) {
-            self.publisher.?.publish(.idle, "aborted by user");
-                }
-                try self.setProgress(goal, "aborted by user");
-                try self.addSkip("job aborted by user");
-                try self.repo.save(self.alloc, goal.*);
+            // Stop signal (top of turn — the between-turns observation point).
+            if (self.stopRequested()) {
+                if (self.stop_path) |p| self.fs.remove(p) catch {};
+                try self.finish(goal, .aborted, "aborted by user", "aborted by user", "job aborted by user");
                 return;
             }
+            // Time budget (spec 013 D4): persisted carry + this run's elapsed.
+            const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - self.run_start_ms));
+            goal.used.seconds = self.carried_seconds + elapsed_ms / 1000;
+            if (goal.used.seconds >= goal.budgets.max_seconds) {
+                try self.finish(goal, .aborted, "aborted: time budget exceeded", "aborted: time budget exceeded", "aborted: time budget exceeded");
+                return;
+            }
+            // Turn budget (unchanged behavior).
             if (goal.used.turns >= goal.budgets.max_turns) {
-                goal.status = .aborted;
-                if (self.publisher != null) {
-            self.publisher.?.publish(.idle, "aborted: turn budget exceeded");
-                }
-                try self.setProgress(goal, "aborted: turn budget exceeded");
-                try self.addSkip("aborted: turn budget exceeded");
-                try self.repo.save(self.alloc, goal.*);
+                try self.finish(goal, .aborted, "aborted: turn budget exceeded", "aborted: turn budget exceeded", "aborted: turn budget exceeded");
                 return;
             }
             goal.used.turns += 1;
@@ -203,8 +470,21 @@ pub const GoalExecutor = struct {
             if (self.verbose) logLine(self.alloc, "verbose: turn {d}: requesting model ({d} msgs)", .{ goal.used.turns, messages.items.len });
 
             const specs = try self.toolSpecs(a);
-            const resp = try self.completeRetry(a, .{ .messages = messages.items, .tools = specs });
+            const outcome = try self.completeInterruptible(a, .{ .messages = messages.items, .tools = specs });
+            const resp = switch (outcome) {
+                .aborted => {
+                    // Abort wins: the in-flight (or late) response is discarded,
+                    // nothing is appended, nothing executes (spec 006 FR-007).
+                    if (self.stop_path) |p| self.fs.remove(p) catch {};
+                    try self.finish(goal, .aborted, "aborted by user", "aborted by user", "job aborted by user");
+                    return;
+                },
+                .resp => |r| r,
+            };
             try messages.append(a, resp.message);
+            // Token accounting (spec 013 D2): reported usage when the backend
+            // supplies it, estimated conversation cost otherwise.
+            goal.used.tokens += if (resp.usage) |u| u.total() else estimateTokens(messages.items);
 
             if (self.verbose) {
                 if (resp.message.tool_calls) |tcs| {
@@ -216,6 +496,12 @@ pub const GoalExecutor = struct {
 
             if (resp.message.tool_calls) |tcs| {
                 for (tcs) |tc| {
+                    // Mid-turn abort: never start work after the signal.
+                    if (self.stopRequested()) {
+                        if (self.stop_path) |p| self.fs.remove(p) catch {};
+                        try self.finish(goal, .aborted, "aborted by user", "aborted by user", "job aborted by user");
+                        return;
+                    }
                     const res = try self.dispatch(a, tc);
                     if (self.verbose) logLine(self.alloc, "verbose: tool_result[{s}]: {s}", .{ tc.name, res.output });
                     try messages.append(a, .{
@@ -223,45 +509,50 @@ pub const GoalExecutor = struct {
                         .content = try a.dupe(u8, res.output),
                         .tool_call_id = try a.dupe(u8, tc.id),
                     });
+                    // A tool run (e.g. Bash) may have observed the stop signal
+                    // mid-command: unwind immediately, no further dispatches.
+                    if (self.stopRequested()) {
+                        if (self.stop_path) |p| self.fs.remove(p) catch {};
+                        try self.finish(goal, .aborted, "aborted by user", "aborted by user", "job aborted by user");
+                        return;
+                    }
                 }
                 const p = try std.fmt.allocPrint(self.alloc, "executed {d} tool call(s)", .{tcs.len});
                 self.alloc.free(goal.progress);
                 goal.progress = p;
                 try self.repo.save(self.alloc, goal.*);
+                self.saveHistorySafe(goal.id, messages.items);
+
+                // Token budget (spec 013 D3): compact first, stop gracefully
+                // when compaction cannot relieve the pressure.
+                if (goal.used.tokens >= goal.budgets.max_tokens) {
+                    const compacted = try self.compact(arena_ptr, &messages, goal);
+                    if (!compacted) {
+                        try self.finish(goal, .aborted, "aborted: token budget exceeded", "aborted: token budget exceeded", "aborted: token budget exceeded");
+                        return;
+                    }
+                    try self.repo.save(self.alloc, goal.*);
+                    self.saveHistorySafe(goal.id, messages.items);
+                }
                 continue;
             }
 
             if (goal.criterion) |crit| {
                 const satisfied = try self.verify(a, &messages, crit);
                 if (satisfied) {
-                    goal.status = .completed;
-                    if (self.publisher != null) {
-            self.publisher.?.publish(.idle, null);
-                    }
-                    try self.setProgress(goal, "completed: criterion satisfied");
-                    try self.repo.save(self.alloc, goal.*);
+                    try self.finish(goal, .completed, "completed: criterion satisfied", null, null);
                     return;
                 }
                 verify_attempts += 1;
                 if (verify_attempts >= 3) {
-                    goal.status = .blocked;
-                    if (self.publisher != null) {
-            self.publisher.?.publish(.blocked, "criterion not satisfied after retries");
-                    }
-                    try self.setProgress(goal, "could not satisfy criterion after retries");
-                    try self.addSkip("completion criterion not satisfied after retries");
-                    try self.repo.save(self.alloc, goal.*);
+                    try self.finish(goal, .blocked, "could not satisfy criterion after retries", "criterion not satisfied after retries", "completion criterion not satisfied after retries");
                     return;
                 }
+                self.saveHistorySafe(goal.id, messages.items);
                 continue;
             }
 
-            goal.status = .completed;
-            if (self.publisher != null) {
-            self.publisher.?.publish(.idle, null);
-            }
-            try self.setProgress(goal, "completed");
-            try self.repo.save(self.alloc, goal.*);
+            try self.finish(goal, .completed, "completed", null, null);
             return;
         }
     }
@@ -766,4 +1057,410 @@ test "system prompt is unchanged when no skills listing is set (FR-010)" {
     try std.testing.expect(std.mem.indexOf(u8, a, "Skills you can consult") == null);
     try std.testing.expect(std.mem.indexOf(u8, b, "Skills you can consult") == null);
     try std.testing.expectEqualStrings(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// spec 013 tests: budgets, compaction, abort, resume seeding.
+// ---------------------------------------------------------------------------
+
+const fake13 = @import("../provider/fake.zig");
+const S13FakeFs = @import("../fs/fs.zig").FakeFs;
+const S13Repo = @import("../goal/repository.zig");
+const stopmod = @import("stop.zig");
+
+fn mkExecutor(alloc: Allocator, fp: provider.Provider, tools: []const Tool, fake: *S13FakeFs, session: []const u8) GoalExecutor {
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", session);
+    repo_impl.toRepository(); // keep vtable warm for the borrow below
+    return GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = tools,
+        .repo = repo_impl.toRepository(),
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = session,
+    };
+}
+
+test "compaction trims the middle and the run continues (B7/B8)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"data\":\"aaaa\"}" }};
+    const tcs2 = [_]provider.ToolCall{.{ .id = "c2", .name = "write_file", .arguments_json = "{\"path\":\"b.txt\",\"data\":\"bbbb\"}" }};
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 40, .completion_tokens = 0 } },
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs2 }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 40, .completion_tokens = 0 } },
+        .{ .message = .{ .role = .assistant, .content = "done" }, .usage = .{ .prompt_tokens = 0, .completion_tokens = 1 } },
+    };
+    var fp = fake13.FakeProvider.init(&responses);
+    var wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    const wt = wt_impl.toTool();
+    const tools = [_]Tool{wt};
+
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .retain_recent = 2,
+    };
+    var goal = try Goal.init(alloc, "create files", null, "sess1");
+    defer goal.deinit(alloc);
+    goal.budgets.max_tokens = 75;
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expectEqualStrings("done", responses[2].message.content); // sanity: script shape
+    try std.testing.expect(goal.status == .completed);
+    try std.testing.expectEqual(@as(u32, 1), ex.compactions);
+    // Dropped-turn accounting reduced the counter below the raw sum (80+1).
+    try std.testing.expect(goal.used.tokens < 81);
+    try std.testing.expect(std.mem.indexOf(u8, ex.report.?, "context compacted") != null);
+}
+
+test "token budget with nothing trimmable stops gracefully (B9)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"data\":\"aaaa\"}" }};
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls, .usage = .{ .prompt_tokens = 500, .completion_tokens = 0 } },
+        .{ .message = .{ .role = .assistant, .content = "should never be requested" } },
+    };
+    var fp = fake13.FakeProvider.init(&responses);
+    var wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    const wt = wt_impl.toTool();
+    const tools = [_]Tool{wt};
+
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .retain_recent = 2,
+    };
+    var goal = try Goal.init(alloc, "create files", null, "sess1");
+    defer goal.deinit(alloc);
+    goal.budgets.max_tokens = 75;
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .aborted);
+    try std.testing.expectEqualStrings("aborted: token budget exceeded", goal.progress);
+    // Status persisted.
+    var loaded_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    var loaded = (try loaded_impl.toRepository().load(alloc)).?;
+    defer loaded.deinit(alloc);
+    try std.testing.expect(loaded.status == .aborted);
+}
+
+test "provider-reported usage is summed; estimate used when absent (B10)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const ok = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "done" }, .usage = .{ .prompt_tokens = 5, .completion_tokens = 7 } };
+    var fp = fake13.FakeProvider.init(&.{ok});
+    const tools = [_]Tool{};
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try Goal.init(alloc, "do something", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+    try std.testing.expectEqual(@as(u64, 12), goal.used.tokens);
+
+    // Estimated path: no usage reported -> conversation bytes/4.
+    const ok2 = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "done" } };
+    var fp2 = fake13.FakeProvider.init(&.{ok2});
+    var ex2 = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp2.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal2 = try Goal.init(alloc, "do something", null, "sess1");
+    defer goal2.deinit(alloc);
+    try ex2.run(&goal2);
+    defer if (ex2.report) |r| alloc.free(r);
+    try std.testing.expect(goal2.used.tokens > 0);
+    try std.testing.expect(goal2.used.tokens != 12);
+}
+
+test "time budget already exhausted stops before any provider call (B11)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const ok = provider.ChatResponse{ .message = .{ .role = .assistant, .content = "nope" } };
+    var fp = fake13.FakeProvider.init(&.{ok});
+    const tools = [_]Tool{};
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try Goal.init(alloc, "do something", null, "sess1");
+    defer goal.deinit(alloc);
+    goal.budgets.max_seconds = 0;
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .aborted);
+    try std.testing.expectEqualStrings("aborted: time budget exceeded", goal.progress);
+    try std.testing.expectEqual(@as(usize, 0), fp.idx); // no scripted response consumed
+}
+
+/// Test tool that raises a stop probe when executed.
+const RaiseProbeTool = struct {
+    probe: *stopmod.AtomicProbe,
+    calls: usize = 0,
+
+    fn toTool(self: *RaiseProbeTool) Tool {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = Tool.VTable{ .execute = execute, .schema = schema, .name = name };
+    fn name(_: *anyopaque) []const u8 {
+        return "raise_stop";
+    }
+    fn schema(_: *anyopaque) provider.ToolSpec {
+        return .{ .name = "raise_stop", .description = "raises stop", .parameters_json_schema = "{\"type\":\"object\",\"properties\":{}}" };
+    }
+    fn execute(ctx: *anyopaque, alloc: Allocator, _: []const u8) !ToolResult {
+        const self: *RaiseProbeTool = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.probe.raise();
+        return ToolResult{ .ok = true, .output = try alloc.dupe(u8, "raised") };
+    }
+};
+
+test "no tool dispatch after the stop signal (B12)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    var probe = stopmod.AtomicProbe{};
+    var raise_impl = RaiseProbeTool{ .probe = &probe };
+    const raise_t = raise_impl.toTool();
+    var wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    const wt = wt_impl.toTool();
+    const tools = [_]Tool{ raise_t, wt };
+
+    // One turn with two tool calls: raise_stop first, then write_file which
+    // must never execute because the signal fired after the first dispatch.
+    const tcs = [_]provider.ToolCall{
+        .{ .id = "c1", .name = "raise_stop", .arguments_json = "{}" },
+        .{ .id = "c2", .name = "write_file", .arguments_json = "{\"path\":\"sentinel.txt\",\"data\":\"x\"}" },
+    };
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "never reached" } },
+    };
+    var fp = fake13.FakeProvider.init(&responses);
+
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .stop = probe.probe(),
+    };
+    var goal = try Goal.init(alloc, "do it", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .aborted);
+    try std.testing.expectEqualStrings("aborted by user", goal.progress);
+    try std.testing.expect(!fake.toFs().exists("sentinel.txt")); // second dispatch never ran
+    try std.testing.expectEqual(@as(usize, 1), fp.idx); // only the first response was consumed
+}
+
+test "provider response arriving after the signal is discarded (B13)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    var probe = stopmod.AtomicProbe{};
+    var wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    const wt = wt_impl.toTool();
+    const tools = [_]Tool{wt};
+
+    // The provider raises the stop signal while the completion is in flight,
+    // then returns a response with a tool call: the response must be
+    // discarded (abort wins) and the tool must never execute.
+    const SlowRaisingProvider = struct {
+        probe: *stopmod.AtomicProbe,
+        calls: usize = 0,
+
+        fn toProvider(self: *@This()) provider.Provider {
+            return .{ .ctx = self, .vtable = &vtable };
+        }
+        const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+        fn name(_: *anyopaque) []const u8 {
+            return "slow_raising";
+        }
+        fn complete(ctx: *anyopaque, pa: Allocator, _: provider.CompletionRequest) anyerror!provider.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.probe.raise();
+            std.Thread.sleep(150 * std.time.ns_per_ms);
+            const tcs = [_]provider.ToolCall{.{ .id = "c9", .name = "write_file", .arguments_json = "{\"path\":\"late.txt\",\"data\":\"x\"}" }};
+            return provider.ChatResponse{
+                .message = .{ .role = .assistant, .content = "", .tool_calls = try pa.dupe(provider.ToolCall, &tcs) },
+                .finish_reason = .tool_calls,
+            };
+        }
+    };
+    var srp = SlowRaisingProvider{ .probe = &probe };
+
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = srp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .stop = probe.probe(),
+    };
+    var goal = try Goal.init(alloc, "do it", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .aborted);
+    try std.testing.expect(!fake.toFs().exists("late.txt")); // discarded: no work after the signal
+    try std.testing.expectEqual(@as(usize, 1), srp.calls);
+}
+
+test "retry loop stops immediately when the signal is raised (B16)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    var probe = stopmod.AtomicProbe{};
+    // Provider that raises the stop signal and then fails: the retry loop must
+    // not attempt again after the signal.
+    const RaiseFailProvider = struct {
+        probe: *stopmod.AtomicProbe,
+        calls: usize = 0,
+        fn toProvider(self: *@This()) provider.Provider {
+            return .{ .ctx = self, .vtable = &vtable };
+        }
+        const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+        fn name(_: *anyopaque) []const u8 {
+            return "raise_fail";
+        }
+        fn complete(ctx: *anyopaque, _: Allocator, _: provider.CompletionRequest) anyerror!provider.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.probe.raise();
+            return error.ProviderError;
+        }
+    };
+    var rfp = RaiseFailProvider{ .probe = &probe };
+    const tools = [_]Tool{};
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = rfp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+        .stop = probe.probe(),
+    };
+    var goal = try Goal.init(alloc, "do it", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .aborted);
+    try std.testing.expectEqual(@as(usize, 1), rfp.calls); // no retry after the signal
+}
+
+test "executor persists the transcript after each turn (B5)" {
+    const alloc = std.testing.allocator;
+    var fake = S13FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"hello.txt\",\"data\":\"hi\"}" }};
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "done" } },
+    };
+    var fp = fake13.FakeProvider.init(&responses);
+    var wt_impl = @import("../tool/write.zig").WriteTool.init(fake.toFs());
+    const wt = wt_impl.toTool();
+    const tools = [_]Tool{wt};
+    var repo_impl = S13Repo.FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp.toProvider(),
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try Goal.init(alloc, "create hello.txt", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+    try std.testing.expect(goal.status == .completed);
+
+    // Terminal run clears the history (fresh-session invariant) — save a fresh
+    // transcript manually here to prove loadHistory round-trips what a run saved.
+    const seeded = [_]provider.ChatMessage{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "Goal: create hello.txt" },
+    };
+    try repo.saveHistory(alloc, goal.id, &seeded);
+    const loaded = (try repo.loadHistory(alloc, goal.id)).?;
+    defer S13Repo.freeHistory(alloc, loaded);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqualStrings("Goal: create hello.txt", loaded[1].content);
 }

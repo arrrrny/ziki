@@ -4,6 +4,7 @@ const Tool = @import("tool.zig").Tool;
 const ToolResult = @import("tool.zig").ToolResult;
 const ToolSpec = @import("../provider/provider.zig").ToolSpec;
 const Fs = @import("../fs/fs.zig").Fs;
+const StopProbe = @import("../agent/stop.zig").StopProbe;
 
 /// Run a shell command in the working directory and capture stdout/stderr +
 /// exit code. A command that does not exit within `timeout_seconds` is killed
@@ -25,6 +26,12 @@ pub const BashTool = struct {
     push_blocked: bool = false,
     /// Set when an authorized push succeeded this run (read by the report).
     push_occurred: bool = false,
+    /// Mid-command stop observation (spec 013 D5/T10). Checked every poll
+    /// iteration (~200 ms); when it fires the child is SIGTERMed and the tool
+    /// returns an aborted result so the goal loop unwinds immediately.
+    stop: ?StopProbe = null,
+    /// Set when this run was aborted via the stop probe (read by the executor/report).
+    aborted: bool = false,
 
     pub fn init(fs: Fs, allow_push: bool, timeout_seconds: u64) BashTool {
         return .{ .fs = fs, .allow_push = allow_push, .timeout_seconds = timeout_seconds };
@@ -77,7 +84,9 @@ pub const BashTool = struct {
         child.stderr_behavior = .Pipe;
         try child.spawn();
 
-        const r = try runWithTimeout(alloc, &child, self.timeout_seconds);
+        var was_aborted = false;
+        const r = try runWithTimeout(alloc, &child, self.timeout_seconds, self.stop, &was_aborted);
+        if (was_aborted) self.aborted = true;
         // FR-002: record a successful authorized push for the job report.
         if (self.allow_push and isUnauthorizedGitPush(parsed.value.command) and r.ok) {
             self.push_occurred = true;
@@ -105,8 +114,10 @@ fn isUnauthorizedGitPush(cmd: []const u8) bool {
 
 /// Spawn the child, drain both stdout and stderr to EOF via `poll`, then reap
 /// with a single `child.wait()`. On timeout the child is signalled (SIGTERM)
-/// and a failure result is returned instead of blocking forever.
-fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: u64) !ToolResult {
+/// and a failure result is returned instead of blocking forever. When `stop`
+/// is provided it is polled every iteration and, on fire, the child is
+/// SIGTERMed and an aborted result is returned (spec 013 T10).
+fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: u64, stop: ?StopProbe, was_aborted: *bool) !ToolResult {
     var out_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer out_buf.deinit(alloc);
     var err_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
@@ -126,6 +137,18 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
 
     const start_ms = std.time.milliTimestamp();
     while (!out_done or !err_done) {
+        // Mid-command abort (spec 013 T10): observe the stop signal inside the
+        // poll loop and terminate the child promptly.
+        if (stop) |p| {
+            if (p.isStop()) {
+                was_aborted.* = true;
+                std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+                return ToolResult{
+                    .ok = false,
+                    .error_message = try std.fmt.allocPrint(alloc, "run_command aborted by user", .{}),
+                };
+            }
+        }
         // Bounded timeout: abort a hung command (FR-008 edge case). When the
         // budget is `no_timeout` we never kill — long validation must complete
         // and its result be captured (FR-003).
@@ -255,7 +278,8 @@ test "BashTool times out a hanging command" {
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
-    const r = try runWithTimeout(alloc, &child, 0);
+    var ab0 = false;
+    const r = try runWithTimeout(alloc, &child, 0, null, &ab0);
     try std.testing.expect(!r.ok);
     try std.testing.expect(std.mem.indexOf(u8, r.error_message.?, "timed out") != null);
     alloc.free(r.error_message.?);
@@ -271,7 +295,8 @@ test "BashTool captures large stderr without truncation" {
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
-    const r = try runWithTimeout(alloc, &child, 30);
+    var ab30 = false;
+    const r = try runWithTimeout(alloc, &child, 30, null, &ab30);
     defer {
         alloc.free(r.output);
         if (r.error_message) |e| alloc.free(e);
@@ -292,7 +317,8 @@ test "BashTool captures merged 2>&1 piped output" {
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
-    const r = try runWithTimeout(alloc, &child, 30);
+    var ab30 = false;
+    const r = try runWithTimeout(alloc, &child, 30, null, &ab30);
     defer {
         alloc.free(r.output);
         if (r.error_message) |e| alloc.free(e);
