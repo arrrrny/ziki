@@ -38,19 +38,31 @@ const Output = @import("shell/repl.zig").Output;
 /// of a side-by-side swarm), else the historical `"default"` so single-instance
 /// behavior is unchanged. The returned slice is owned by `alloc`.
 fn resolveSessionId(alloc: Allocator) ![]u8 {
-    return resolveSessionIdFrom(alloc, std.posix.getenv("ZIKI_SESSION_ID"), std.posix.getenv("HERDR_PANE_ID"));
+    return resolveSessionIdFrom(alloc, std.posix.getenv("ZIKI_SESSION_ID"), std.posix.getenv("HERDR_PANE_ID")) catch |err| {
+        if (err == error.InvalidSessionId) try emitErr("invalid session id — ZIKI_SESSION_ID / HERDR_PANE_ID must not contain path separators");
+        return err;
+    };
 }
 
 /// Pure variant so the precedence boundary is testable without mutating the
 /// process environment. Empty strings count as unset.
 fn resolveSessionIdFrom(alloc: Allocator, ziki_env: ?[]const u8, pane_env: ?[]const u8) ![]u8 {
     if (ziki_env) |z| {
-        if (z.len > 0) return alloc.dupe(u8, z);
+        if (z.len > 0) return dupSessionId(alloc, z);
     }
     if (pane_env) |p| {
-        if (p.len > 0) return alloc.dupe(u8, p);
+        if (p.len > 0) return dupSessionId(alloc, p);
     }
-    return alloc.dupe(u8, "default");
+    return dupSessionId(alloc, "default");
+}
+
+/// Session ids become file-name fragments (`goal.<id>.json`, `stop.<id>`):
+/// reject path separators so an id can never escape the state dir.
+fn dupSessionId(alloc: Allocator, id: []const u8) ![]u8 {
+    for (id) |ch| {
+        if (ch == '/' or ch == '\\') return error.InvalidSessionId;
+    }
+    return alloc.dupe(u8, id);
 }
 
 fn emit(comptime fmt: []const u8, args: anytype) !void {
@@ -141,7 +153,16 @@ fn buildStatePublisher(
                     try emitErr("invalid HERDR_API_URL — unix:// needs an absolute socket path: unix:///abs/path.sock[/api/route]");
                     return error.InvalidApiUrl;
                 };
+                // The /api/ marker is reserved for the request route: a socket
+                // path containing it is ambiguous and would mis-route.
+                if (!std.mem.eql(u8, parts.request_path, "/") and !std.mem.startsWith(u8, parts.request_path, "/api/v1/")) {
+                    const msg = try std.fmt.allocPrint(alloc, "ambiguous HERDR_API_URL — unix:// socket path must not contain /api/ (reserved route marker): {s}", .{api_url});
+                    defer alloc.free(msg);
+                    try emitErr(msg);
+                    return error.InvalidApiUrl;
+                }
                 const st = try alloc.create(socket_transport.SocketTransport);
+                errdefer alloc.destroy(st);
                 st.* = try socket_transport.SocketTransport.init(alloc, parts.socket_path);
                 herdr_socket_slot.* = st;
                 t = st.toTransport();

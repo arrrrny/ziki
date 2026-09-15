@@ -83,6 +83,12 @@ pub fn post(alloc: Allocator, socket_path: []const u8, method: []const u8, reque
     var stream = try std.net.connectUnixSocket(socket_path);
     defer stream.close();
 
+    // FR-006: a stalled listener must surface as a swallowed reporter error,
+    // never as a hung goal turn.
+    const tv = std.posix.timeval{ .sec = 10, .usec = 0 };
+    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+
     // Build the exact wire shape an HTTP listener expects (FR-003): request
     // line, Host, caller headers (content-type), Content-Length, body.
     var req = try std.ArrayList(u8).initCapacity(alloc, 0);
@@ -99,17 +105,22 @@ pub fn post(alloc: Allocator, socket_path: []const u8, method: []const u8, reque
     try w.writeAll(body);
     try stream.writeAll(req.items);
 
-    // Read the whole response (close-delimited).
+    // Read the whole response (close-delimited), capped so a misbehaving
+    // listener cannot grow memory without limit.
     var raw = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer raw.deinit(alloc);
     var buf: [8192]u8 = undefined;
     while (true) {
         const n = try stream.read(&buf);
         if (n == 0) break;
+        if (raw.items.len + n > max_response_bytes) return error.ResponseTooLarge;
         try raw.appendSlice(alloc, buf[0..n]);
     }
     return parseResponse(alloc, raw.items);
 }
+
+/// Upper bound on a reporter response; real ACK bodies are tiny.
+const max_response_bytes: usize = 1 << 20;
 
 /// Parse status line + body from a close-delimited HTTP response.
 pub fn parseResponse(alloc: Allocator, raw: []const u8) !HttpResponse {
