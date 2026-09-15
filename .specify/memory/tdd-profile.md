@@ -93,14 +93,13 @@ suite_seconds: 41 # observed wall time of the full suite (full compile + run)
 - Acceptance / E2E runner: none dedicated. CLI-level behavior is exercised only
   through the executor integration tests; `src/main.zig` has no tests. No
   contract or approval/snapshot tool exists.
-- **GAP — `src/shell/shell_test.zig` is NOT collected by the suite.** Its 7 tests
-  (parsing, dispatch, REPL) do not run under `zig build test`: the aggregator's
-  `test "aggregator loads all modules"` block references every other module via
-  `_ = mod;` but omits `shell_test`. Running the file standalone fails to
-  compile — `Capture.init` calls `std.ArrayList(u8).initCapacity(a, 0)`, which in
-  Zig 0.15 returns an error union and must be `try`-wrapped (verified: exit 1).
-  These tests are currently dead and broken. Work in the shell package needs this
-  fixed first; the loop cannot rely on them until then.
+- **FIXED — `src/shell/shell_test.zig` is now collected by the suite.** Its 7
+  tests (parsing, dispatch, REPL) run under `zig build test` as
+  `src.shell.shell_test.test.*`. Root cause: the aggregator's
+  `test "aggregator loads all modules"` block referenced every other module via
+  `_ = mod;` but omitted `shell_test`, so Zig never collected its `test`
+  declarations. Fix: add `_ = shell_test;` to the aggregator block
+  (`tests.zig:55`). The `Capture.init` error-union fix was already in place.
 - `memory-harness.sh` is an operational memory-budget harness for the built REPL
   binary, not part of the test suite. It does not gate merges and is out of scope
   for TDD.
