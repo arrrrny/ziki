@@ -11,10 +11,19 @@ const HttpResponse = @import("../provider/transport.zig").HttpResponse;
 pub const HerdrHttpClient = struct {
     alloc: Allocator,
     transport: Transport,
+    /// Owned copy of the caller's URL (issue #20 bug 1): the client outlives
+    /// the caller's slice (buildStatePublisher frees `api_url` right after
+    /// init), so `init` dupes and `deinit` frees.
     base_url: []const u8,
 
-    pub fn init(alloc: Allocator, transport: Transport, base_url: []const u8) HerdrHttpClient {
-        return .{ .alloc = alloc, .transport = transport, .base_url = base_url };
+    pub fn init(alloc: Allocator, transport: Transport, base_url: []const u8) !HerdrHttpClient {
+        return .{ .alloc = alloc, .transport = transport, .base_url = try alloc.dupe(u8, base_url) };
+    }
+
+    /// Free the owned URL copy. Must be called by whoever keeps the client
+    /// alive for a run (main.zig's `herdr_client_slot`).
+    pub fn deinit(self: *HerdrHttpClient) void {
+        self.alloc.free(self.base_url);
     }
 
     /// Adapt this client into the `HerdrReporter` DI interface so it can be
@@ -127,7 +136,8 @@ test "HerdrHttpClient POSTs contract JSON to the report endpoint (U11)" {
     const alloc = std.testing.allocator;
     var cap = CapturingTransport.init(alloc);
     defer cap.deinit();
-    var hc = HerdrHttpClient.init(alloc, cap.toTransport(), "http://localhost:7878");
+    var hc = try HerdrHttpClient.init(alloc, cap.toTransport(), "http://localhost:7878");
+    defer hc.deinit();
     const params = state.PaneReportParams{
         .pane_id = "pane-1",
         .source = "herdr:ziki",
@@ -155,7 +165,8 @@ test "HerdrHttpClient includes message in body when present (U11)" {
     const alloc = std.testing.allocator;
     var cap = CapturingTransport.init(alloc);
     defer cap.deinit();
-    var hc = HerdrHttpClient.init(alloc, cap.toTransport(), "http://localhost:7878");
+    var hc = try HerdrHttpClient.init(alloc, cap.toTransport(), "http://localhost:7878");
+    defer hc.deinit();
     const params = state.PaneReportParams{
         .pane_id = "pane-1",
         .source = "herdr:ziki",
@@ -199,7 +210,8 @@ test "HerdrHttpClient swallows transport error and does not push (U11 error path
     var cap = CapturingTransport.init(alloc);
     cap.fail = true;
     defer cap.deinit();
-    var hc = HerdrHttpClient.init(alloc, cap.toTransport(), "http://localhost:7878");
+    var hc = try HerdrHttpClient.init(alloc, cap.toTransport(), "http://localhost:7878");
+    defer hc.deinit();
     const params = state.PaneReportParams{
         .pane_id = "pane-1",
         .source = "herdr:ziki",
@@ -214,4 +226,31 @@ test "HerdrHttpClient swallows transport error and does not push (U11 error path
     try hc.doReport(alloc, params);
     // No request was recorded because the transport failed before capturing.
     try std.testing.expectEqual(@as(?[]const u8, null), cap.method);
+}
+
+// Issue #20 bug 1 regression: the client must own its base_url.
+test "HerdrHttpClient outlives the caller's api_url (use-after-free regression)" {
+    const alloc = std.testing.allocator;
+    var cap = CapturingTransport.init(alloc);
+    defer cap.deinit();
+    const api_url = try alloc.dupe(u8, "http://localhost:7878");
+    var hc = try HerdrHttpClient.init(alloc, cap.toTransport(), api_url);
+    defer hc.deinit();
+    // Caller drops its copy right after init — exactly what buildStatePublisher
+    // did when the client stored the URL by reference (issue #20 bug 1).
+    alloc.free(api_url);
+    const params = state.PaneReportParams{
+        .pane_id = "pane-1",
+        .source = "herdr:ziki",
+        .agent = "ziki",
+        .state = "working",
+        .message = null,
+        .seq = 1,
+        .agent_session_id = "goal-1",
+        .agent_session_path = "/wd/.ziki",
+    };
+    // Must read the owned copy, not freed memory, and reach the right URL.
+    try hc.doReport(alloc, params);
+    try std.testing.expect(std.mem.startsWith(u8, cap.url.?, "http://localhost:7878"));
+    try std.testing.expect(std.mem.endsWith(u8, cap.url.?, "/api/v1/pane/report/agent"));
 }
