@@ -9,6 +9,7 @@ const Fs = @import("fs/fs.zig").Fs;
 const GoalExecutor = @import("agent/executor.zig").GoalExecutor;
 const state = @import("agent/state.zig");
 const herdr = @import("agent/herdr.zig");
+const socket_transport = @import("provider/transport_socket.zig");
 const Transport = @import("provider/transport.zig").Transport;
 const FakeTransport = @import("provider/transport.zig").FakeTransport;
 const Goal = @import("goal/goal.zig").Goal;
@@ -32,7 +33,37 @@ const parser = @import("shell/parser.zig");
 const Repl = @import("shell/repl.zig");
 const Output = @import("shell/repl.zig").Output;
 
-const SESSION_ID = "default";
+/// Resolve this instance's session id (issue #20 bug 2): `ZIKI_SESSION_ID`
+/// wins, then `HERDR_PANE_ID` (a herdr pane is exactly the per-window identity
+/// of a side-by-side swarm), else the historical `"default"` so single-instance
+/// behavior is unchanged. The returned slice is owned by `alloc`.
+fn resolveSessionId(alloc: Allocator) ![]u8 {
+    return resolveSessionIdFrom(alloc, std.posix.getenv("ZIKI_SESSION_ID"), std.posix.getenv("HERDR_PANE_ID")) catch |err| {
+        if (err == error.InvalidSessionId) try emitErr("invalid session id — ZIKI_SESSION_ID / HERDR_PANE_ID must not contain path separators");
+        return err;
+    };
+}
+
+/// Pure variant so the precedence boundary is testable without mutating the
+/// process environment. Empty strings count as unset.
+fn resolveSessionIdFrom(alloc: Allocator, ziki_env: ?[]const u8, pane_env: ?[]const u8) ![]u8 {
+    if (ziki_env) |z| {
+        if (z.len > 0) return dupSessionId(alloc, z);
+    }
+    if (pane_env) |p| {
+        if (p.len > 0) return dupSessionId(alloc, p);
+    }
+    return dupSessionId(alloc, "default");
+}
+
+/// Session ids become file-name fragments (`goal.<id>.json`, `stop.<id>`):
+/// reject path separators so an id can never escape the state dir.
+fn dupSessionId(alloc: Allocator, id: []const u8) ![]u8 {
+    for (id) |ch| {
+        if (ch == '/' or ch == '\\') return error.InvalidSessionId;
+    }
+    return alloc.dupe(u8, id);
+}
 
 fn emit(comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(std.heap.page_allocator, fmt ++ "\n", args);
@@ -93,11 +124,14 @@ fn stdoutAnyWriter() std.io.AnyWriter {
 
 /// Build the Herdr `StatePublisher` for a goal (spec 011, FR-008).
 ///
-/// When `pane_id` is set, resolves the Herdr API URL and builds a real
-/// `HerdrHttpClient` reporter (stored in `herdr_client_slot`, which the caller
-/// owns and keeps alive for the run) so Ziki pushes state to Herdr. When
-/// `pane_id` is null, returns a publisher with `reporter = null`: it still
-/// emits the screen marker + OSC title but never pushes (degraded mode).
+/// When `pane_id` is set, resolves the Herdr API URL, selects the transport by
+/// its scheme (spec 012 FR-002: `unix://` → socket transport stored in
+/// `herdr_socket_slot`, http(s) → the provider's HTTP transport, anything else
+/// fails fast with a clear message, FR-007), builds a real `HerdrHttpClient`
+/// reporter (stored in `herdr_client_slot`, which the caller owns and keeps
+/// alive for the run) so Ziki pushes state to Herdr. When `pane_id` is null,
+/// returns a publisher with `reporter = null`: it still emits the screen
+/// marker + OSC title but never pushes (degraded mode).
 fn buildStatePublisher(
     alloc: Allocator,
     transport: Transport,
@@ -105,19 +139,47 @@ fn buildStatePublisher(
     goal_id: []const u8,
     state_dir: []const u8,
     herdr_client_slot: *?herdr.HerdrHttpClient,
+    herdr_socket_slot: *?*socket_transport.SocketTransport,
     writer: std.io.AnyWriter,
 ) !state.StatePublisher {
     var reporter: ?state.HerdrReporter = null;
     if (pane_id) |_| {
         const api_url = try herdr.resolveApiUrl(alloc);
-        herdr_client_slot.* = herdr.HerdrHttpClient.init(alloc, transport, api_url);
+        defer alloc.free(api_url);
+        var t = transport;
+        switch (socket_transport.selectByUrl(api_url)) {
+            .socket => {
+                const parts = socket_transport.splitUnixUrl(api_url) orelse {
+                    try emitErr("invalid HERDR_API_URL — unix:// needs an absolute socket path: unix:///abs/path.sock[/api/route]");
+                    return error.InvalidApiUrl;
+                };
+                // The /api/ marker is reserved for the request route: a socket
+                // path containing it is ambiguous and would mis-route.
+                if (!std.mem.eql(u8, parts.request_path, "/") and !std.mem.startsWith(u8, parts.request_path, "/api/v1/")) {
+                    const msg = try std.fmt.allocPrint(alloc, "ambiguous HERDR_API_URL — unix:// socket path must not contain /api/ (reserved route marker): {s}", .{api_url});
+                    defer alloc.free(msg);
+                    try emitErr(msg);
+                    return error.InvalidApiUrl;
+                }
+                const st = try alloc.create(socket_transport.SocketTransport);
+                errdefer alloc.destroy(st);
+                st.* = try socket_transport.SocketTransport.init(alloc, parts.socket_path);
+                herdr_socket_slot.* = st;
+                t = st.toTransport();
+            },
+            .http => {},
+            .unsupported => {
+                try emitErr("unsupported HERDR_API_URL scheme — use http://, https:// or unix:///abs/path.sock");
+                return error.UnsupportedApiUrl;
+            },
+        }
+        herdr_client_slot.* = try herdr.HerdrHttpClient.init(alloc, t, api_url);
         reporter = (herdr_client_slot.*).?.toReporter();
-        alloc.free(api_url);
     }
     return state.StatePublisher.init(alloc, reporter, writer, pane_id orelse "", goal_id, state_dir);
 }
 
-fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_iface: Fs, registry: *const skill_registry.SkillRegistry) !void {
+fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, session_id: []const u8, fs_iface: Fs, registry: *const skill_registry.SkillRegistry) !void {
     if (tokens.len < 2) {
         try emitErr("goal objective must not be empty");
         return;
@@ -238,7 +300,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     }
     const tools = tools_storage[0..tools_len];
 
-    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
+    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, session_id);
     const repo = repo_impl.toRepository();
 
     var ex = GoalExecutor{
@@ -248,7 +310,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
         .repo = repo,
         .fs = fs_iface,
         .dir = state_dir,
-        .session_id = SESSION_ID,
+        .session_id = session_id,
         .verbose = verbose,
         .skills_listing = skills_listing,
         .clean_tree = clean_tree,
@@ -258,7 +320,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     // would otherwise be skipped and the buffer would leak).
     defer if (ex.report) |r| alloc.free(r);
 
-    var goal = try Goal.init(alloc, objective, criterion, SESSION_ID);
+    var goal = try Goal.init(alloc, objective, criterion, session_id);
     defer goal.deinit(alloc);
 
     // Spec 011: wire the Herdr state publisher. `buildStatePublisher` reads
@@ -266,7 +328,16 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     // publisher (screen markers + OSC only) when absent (FR-008).
     const stdout_writer = stdoutAnyWriter();
     var herdr_client_slot: ?herdr.HerdrHttpClient = null;
-    ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), std.posix.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, stdout_writer);
+    // The client owns its URL copy (issue #20 bug 1); free it when the run ends.
+    defer if (herdr_client_slot) |*c| c.deinit();
+    // Spec 012: a unix:// HERDR_API_URL swaps in a socket transport for the
+    // run; it is heap-allocated because the client stores the vtable by value.
+    var herdr_socket_slot: ?*socket_transport.SocketTransport = null;
+    defer if (herdr_socket_slot) |sock| {
+        sock.deinit();
+        alloc.destroy(sock);
+    };
+    ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), std.posix.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, &herdr_socket_slot, stdout_writer);
 
     try emitStatus(.active);
     try ex.run(&goal);
@@ -287,8 +358,8 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, fs_ifa
     try emit("  {s}", .{push_line});
 }
 
-fn runStop(alloc: Allocator, state_dir: []const u8) !void {
-    const p = try std.fs.path.join(alloc, &.{ state_dir, "stop." ++ SESSION_ID });
+fn runStop(alloc: Allocator, state_dir: []const u8, session_id: []const u8) !void {
+    const p = try std.fmt.allocPrint(alloc, "{s}/stop.{s}", .{ state_dir, session_id });
     defer alloc.free(p);
     std.fs.cwd().writeFile(.{ .sub_path = p, .data = "" }) catch {
         try emitErr("could not write stop signal");
@@ -297,8 +368,8 @@ fn runStop(alloc: Allocator, state_dir: []const u8) !void {
     try emit("stop signal set; the active goal will abort on its next turn", .{});
 }
 
-fn runStatus(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
-    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
+fn runStatus(alloc: Allocator, state_dir: []const u8, session_id: []const u8, fs_iface: Fs) !void {
+    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, session_id);
     const repo = repo_impl.toRepository();
     const g = repo.load(alloc) catch null;
     if (g == null) {
@@ -313,8 +384,8 @@ fn runStatus(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
     try emit("turns:     {d}/{d}", .{ goal.used.turns, goal.budgets.max_turns });
 }
 
-fn runGoals(alloc: Allocator, state_dir: []const u8, fs_iface: Fs) !void {
-    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, SESSION_ID);
+fn runGoals(alloc: Allocator, state_dir: []const u8, session_id: []const u8, fs_iface: Fs) !void {
+    var repo_impl = FsGoalRepository.init(fs_iface, state_dir, session_id);
     const repo = repo_impl.toRepository();
     const g = repo.load(alloc) catch null;
     if (g == null) {
@@ -345,11 +416,11 @@ fn runProvider(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8) !v
 
 // --- Handler context structs + vtable bindings ---
 
-const GoalCtx = struct { state_dir: []const u8, fs: Fs, registry: *const skill_registry.SkillRegistry };
-const StopCtx = struct { state_dir: []const u8 };
+const GoalCtx = struct { state_dir: []const u8, session_id: []const u8, fs: Fs, registry: *const skill_registry.SkillRegistry };
+const StopCtx = struct { state_dir: []const u8, session_id: []const u8 };
 const ProviderCtx = struct { state_dir: []const u8 };
-const StatusCtx = struct { state_dir: []const u8, fs: Fs };
-const GoalsCtx = struct { state_dir: []const u8, fs: Fs };
+const StatusCtx = struct { state_dir: []const u8, session_id: []const u8, fs: Fs };
+const GoalsCtx = struct { state_dir: []const u8, session_id: []const u8, fs: Fs };
 const SkillCtx = struct { registry: *const skill_registry.SkillRegistry };
 const HelpCtx = struct {};
 
@@ -360,13 +431,13 @@ fn goalHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     try toks.append(alloc, "/goal");
     var it = std.mem.tokenizeScalar(u8, intent.args, ' ');
     while (it.next()) |t| try toks.append(alloc, t);
-    runGoal(alloc, toks.items, self.state_dir, self.fs, self.registry) catch {};
+    runGoal(alloc, toks.items, self.state_dir, self.session_id, self.fs, self.registry) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
 fn stopHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     const self: *StopCtx = @ptrCast(@alignCast(ctx_));
     _ = intent;
-    runStop(alloc, self.state_dir) catch {};
+    runStop(alloc, self.state_dir, self.session_id) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
 fn providerHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
@@ -382,13 +453,13 @@ fn providerHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
 fn statusHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     const self: *StatusCtx = @ptrCast(@alignCast(ctx_));
     _ = intent;
-    runStatus(alloc, self.state_dir, self.fs) catch {};
+    runStatus(alloc, self.state_dir, self.session_id, self.fs) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
 fn goalsHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
     const self: *GoalsCtx = @ptrCast(@alignCast(ctx_));
     _ = intent;
-    runGoals(alloc, self.state_dir, self.fs) catch {};
+    runGoals(alloc, self.state_dir, self.session_id, self.fs) catch {};
     return Result{ .output = try alloc.dupe(u8, "") };
 }
 fn skillHandle(ctx_: *anyopaque, alloc: Allocator, intent: Intent) !Result {
@@ -466,6 +537,11 @@ pub fn main() !void {
     defer alloc.free(state_dir);
     std.fs.cwd().makePath(state_dir) catch {};
 
+    // Issue #20 bug 2: per-window session identity, resolved once and shared
+    // by the goal, stop, status, and goals commands.
+    const session_id = try resolveSessionId(alloc);
+    defer alloc.free(session_id);
+
     var realfs_impl = RealFs.init(cwd);
     const fs_iface = realfs_impl.toFs();
 
@@ -483,11 +559,11 @@ pub fn main() !void {
     defer skill_reg.deinit();
 
     // Composition root: build the dispatcher and inject the handlers.
-    var gh = GoalCtx{ .state_dir = state_dir, .fs = fs_iface, .registry = &skill_reg };
-    var sh = StopCtx{ .state_dir = state_dir };
+    var gh = GoalCtx{ .state_dir = state_dir, .session_id = session_id, .fs = fs_iface, .registry = &skill_reg };
+    var sh = StopCtx{ .state_dir = state_dir, .session_id = session_id };
     var ph = ProviderCtx{ .state_dir = state_dir };
-    var st = StatusCtx{ .state_dir = state_dir, .fs = fs_iface };
-    var gl = GoalsCtx{ .state_dir = state_dir, .fs = fs_iface };
+    var st = StatusCtx{ .state_dir = state_dir, .session_id = session_id, .fs = fs_iface };
+    var gl = GoalsCtx{ .state_dir = state_dir, .session_id = session_id, .fs = fs_iface };
     var sk = SkillCtx{ .registry = &skill_reg };
     var hp = HelpCtx{};
 
@@ -528,15 +604,22 @@ test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null other
     const t = ft.toTransport();
 
     var slot: ?herdr.HerdrHttpClient = null;
+    var sock_slot: ?*socket_transport.SocketTransport = null;
     var wbuf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&wbuf);
     const w = fbs.writer().any();
-    const with = try buildStatePublisher(alloc, t, "pane-9", "goal-9", "/wd", &slot, w);
+    const with = try buildStatePublisher(alloc, t, "pane-9", "goal-9", "/wd", &slot, &sock_slot, w);
     try std.testing.expect(with.reporter != null);
     try std.testing.expect(slot != null); // client retained for the run's lifetime
+    if (slot) |*c| c.deinit();
+    if (sock_slot) |st| {
+        st.deinit();
+        alloc.destroy(st);
+    }
 
     var slot2: ?herdr.HerdrHttpClient = null;
-    var without = try buildStatePublisher(alloc, t, null, "goal-10", "/wd", &slot2, w);
+    var sock_slot2: ?*socket_transport.SocketTransport = null;
+    var without = try buildStatePublisher(alloc, t, null, "goal-10", "/wd", &slot2, &sock_slot2, w);
     try std.testing.expect(without.reporter == null);
     try std.testing.expect(slot2 == null);
 
@@ -546,4 +629,63 @@ test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null other
     without.writer = fbs2.writer().any();
     without.publish(.working, null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..fbs2.pos], "[ziki-state: working]") != null);
+}
+
+// Issue #20 bug 2: the session id is resolved, never hard-coded.
+test "resolveSessionIdFrom precedence: ZIKI_SESSION_ID > HERDR_PANE_ID > default (U1)" {
+    const alloc = std.testing.allocator;
+    // Explicit env wins.
+    const a = try resolveSessionIdFrom(alloc, "win-7", "pane-9");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("win-7", a);
+    // Pane id is the per-window identity when no explicit session is set.
+    const b = try resolveSessionIdFrom(alloc, null, "pane-9");
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("pane-9", b);
+    // Neither set: the historical default (backward compatible).
+    const c = try resolveSessionIdFrom(alloc, null, null);
+    defer alloc.free(c);
+    try std.testing.expectEqualStrings("default", c);
+    // Empty strings are treated as unset (a blank env var must not isolate goals
+    // under an empty id).
+    const d = try resolveSessionIdFrom(alloc, "", "");
+    defer alloc.free(d);
+    try std.testing.expectEqualStrings("default", d);
+    const e = try resolveSessionIdFrom(alloc, "", "pane-2");
+    defer alloc.free(e);
+    try std.testing.expectEqualStrings("pane-2", e);
+}
+
+test "resolved session ids isolate goal repositories (A2)" {
+    const alloc = std.testing.allocator;
+    var fake = @import("fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    // Two side-by-side windows: ids resolved from different pane envs.
+    const id_a = try resolveSessionIdFrom(alloc, null, "pane-1");
+    defer alloc.free(id_a);
+    const id_b = try resolveSessionIdFrom(alloc, null, "pane-2");
+    defer alloc.free(id_b);
+    try std.testing.expect(!std.mem.eql(u8, id_a, id_b));
+
+    var repo_a_impl = FsGoalRepository.init(fake.toFs(), ".ziki", id_a);
+    const repo_a = repo_a_impl.toRepository();
+    var repo_b_impl = FsGoalRepository.init(fake.toFs(), ".ziki", id_b);
+    const repo_b = repo_b_impl.toRepository();
+
+    var g = try Goal.init(alloc, "window A objective", null, id_a);
+    defer g.deinit(alloc);
+    try repo_a.save(alloc, g);
+
+    // A persists its own goal; B sees nothing (per-window isolation).
+    var loaded_a = (try repo_a.load(alloc)).?;
+    defer loaded_a.deinit(alloc);
+    try std.testing.expectEqualStrings("window A objective", loaded_a.objective);
+    try std.testing.expect((try repo_b.load(alloc)) == null);
+
+    // Isolation is on-disk: each session has its own state file.
+    const fs_iface = fake.toFs();
+    try std.testing.expect(fs_iface.exists(".ziki/goal.pane-1.json"));
+    try std.testing.expect(!fs_iface.exists(".ziki/goal.pane-2.json"));
+    try std.testing.expect(!fs_iface.exists(".ziki/goal.default.json"));
 }
