@@ -454,6 +454,15 @@ pub const GoalExecutor = struct {
         if (self.publisher != null) {
             self.publisher.?.publish(.working, null);
         }
+        // Spec 016 (issue #19): already-applied detection — one cheap
+        // verification call before any provider turn. Only for fresh goals
+        // (a resumed transcript already reflects the work done so far).
+        if (goal.criterion != null and history.len == 0) {
+            if ((try self.verify(a, &messages, goal.criterion.?)) orelse false) {
+                try self.finish(goal, .completed, "already done: criterion satisfied before starting", "already satisfied", "criterion already satisfied — no provider turns needed");
+                return;
+            }
+        }
         while (goal.status == .active) {
             // Stop signal (top of turn — the between-turns observation point).
             if (self.stopRequested()) {
@@ -1664,4 +1673,217 @@ test "resume round-trip through the store continues an interrupted goal (B18)" {
         // Transcript cleared at terminal so the next goal starts clean.
         try std.testing.expect((try repo2.loadHistory(alloc, reloaded.id)) == null);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: already-applied detection + job report completeness (spec 016).
+// ---------------------------------------------------------------------------
+
+/// Minimal counting provider: scripted responses in order (repeats the last),
+/// recording how many times the model was called at all.
+const CountingProvider = struct {
+    responses: []const provider.ChatResponse,
+    idx: usize = 0,
+    calls: usize = 0,
+
+    fn init(responses: []const provider.ChatResponse) CountingProvider {
+        return .{ .responses = responses };
+    }
+    fn toProvider(self: *CountingProvider) provider.Provider {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+
+    fn name(_: *anyopaque) []const u8 {
+        return "counting";
+    }
+    fn complete(ctx: *anyopaque, alloc: Allocator, _: provider.CompletionRequest) !provider.ChatResponse {
+        const self: *CountingProvider = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const r = self.responses[@min(self.idx, self.responses.len - 1)];
+        if (self.idx + 1 < self.responses.len) self.idx += 1;
+        var tcs: ?[]provider.ToolCall = null;
+        if (r.message.tool_calls) |src| {
+            const owned = try alloc.alloc(provider.ToolCall, src.len);
+            for (src, 0..) |tc, i| {
+                owned[i] = .{
+                    .id = try alloc.dupe(u8, tc.id),
+                    .name = try alloc.dupe(u8, tc.name),
+                    .arguments_json = try alloc.dupe(u8, tc.arguments_json),
+                };
+            }
+            tcs = owned;
+        }
+        return .{ .message = .{ .role = r.message.role, .content = try alloc.dupe(u8, r.message.content), .tool_calls = tcs }, .finish_reason = r.finish_reason };
+    }
+};
+
+test "already-satisfied criterion short-circuits before provider turns (A2)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    // The pre-check IS the only model call: it answers YES immediately.
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "YES — nothing to do" } },
+    };
+    var cp = CountingProvider.init(&responses);
+    const fp = cp.toProvider();
+
+    const tools = [_]Tool{};
+    var repo_impl = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try @import("../goal/goal.zig").Goal.init(alloc, "make it so", "criterion already holds", "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .completed);
+    try std.testing.expect(std.mem.indexOf(u8, goal.progress, "already done") != null);
+    try std.testing.expectEqual(@as(usize, 1), cp.calls); // the pre-check only — no turns burned
+    try std.testing.expect(std.mem.indexOf(u8, ex.report.?, "already satisfied") != null);
+}
+
+test "unmet criterion still runs the normal loop after the pre-check (A2)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"hello.txt\",\"data\":\"hi\"}" }};
+    // Response[0] feeds the spec 016 pre-check (says NO), then the loop runs.
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "NO not yet" } },
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "done" } },
+        .{ .message = .{ .role = .assistant, .content = "YES now" } },
+    };
+    var cp = CountingProvider.init(&responses);
+    const fp = cp.toProvider();
+
+    const WriteTool = @import("../tool/write.zig").WriteTool;
+    var wt_impl = WriteTool.init(fake.toFs());
+    const write_t = wt_impl.toTool();
+    const tools = [_]Tool{write_t};
+    var repo_impl = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try @import("../goal/goal.zig").Goal.init(alloc, "write hello", "hello.txt exists with hi", "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    // Pre-check said NO, then the loop ran to completion.
+    try std.testing.expect(goal.status == .completed);
+    try std.testing.expect(std.mem.indexOf(u8, goal.progress, "already done") == null);
+    const content = try fake.readFile(alloc, "hello.txt");
+    defer alloc.free(content);
+    try std.testing.expectEqualStrings("hi", content);
+}
+
+test "job report covers intentional, untracked, and reverted paths (A3)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(cwd);
+
+    // Real repo so the drift revert (git clean) operates for real.
+    const run = struct {
+        fn git(a: Allocator, dir: []const u8, args: []const []const u8) void {
+            var argv = std.ArrayList([]const u8).initCapacity(a, 4) catch return;
+            defer argv.deinit(a);
+            argv.appendSlice(a, &.{ "git", "-C", dir }) catch return;
+            argv.appendSlice(a, args) catch return;
+            var child = std.process.Child.init(argv.items, a);
+            child.stdin_behavior = .Ignore;
+            child.stdout_behavior = .Ignore;
+            child.stderr_behavior = .Ignore;
+            _ = child.spawnAndWait() catch {};
+        }
+    };
+    run.git(alloc, cwd, &.{ "init", "-q" });
+    run.git(alloc, cwd, &.{ "config", "user.email", "t@t" });
+    run.git(alloc, cwd, &.{ "config", "user.name", "t" });
+    try tmp.dir.writeFile(.{ .sub_path = "tracked.txt", .data = "base" });
+    run.git(alloc, cwd, &.{ "add", "tracked.txt" });
+    run.git(alloc, cwd, &.{ "commit", "-q", "-m", "init" });
+    // Pre-existing untracked user file: must survive untouched, unreported.
+    try tmp.dir.writeFile(.{ .sub_path = "user-notes.txt", .data = "mine" });
+
+    var impl = @import("../fs/fs.zig").RealFs.init(cwd);
+    const fs = impl.toFs();
+    const WriteTool = @import("../tool/write.zig").WriteTool;
+    const BashTool = @import("../tool/bash.zig").BashTool;
+    var wt_impl = WriteTool.init(fs);
+    const write_t = wt_impl.toTool();
+    var bt_impl = BashTool.init(fs, false, 30);
+    const bash_t = bt_impl.toTool();
+    const tools = [_]Tool{ write_t, bash_t };
+
+    const tcs1 = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"intentional-new.txt\",\"data\":\"on purpose\"}" }};
+    // BashTool spawns in the process cwd, so aim the drift at the tmp repo
+    // with an absolute path.
+    const drift_cmd = try std.fmt.allocPrint(alloc, "{{\"command\":\"echo drift > {s}/drift-file.txt\"}}", .{cwd});
+    defer alloc.free(drift_cmd);
+    const tcs2 = [_]provider.ToolCall{.{ .id = "c2", .name = "run_command", .arguments_json = drift_cmd }};
+    // No criterion → no pre-check; the loop drives both tool calls directly.
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs1 }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs2 }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "done" } },
+    };
+    var cp = CountingProvider.init(&responses);
+    const fp = cp.toProvider();
+
+    var repo_impl = FsGoalRepository.init(fs, ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fs,
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try @import("../goal/goal.zig").Goal.init(alloc, "produce the artifact", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .completed);
+    const r = ex.report.?;
+    // Intentional (untracked) change reported as changed:
+    try std.testing.expect(std.mem.indexOf(u8, r, "changed:\n  intentional-new.txt\n") != null);
+    // Incidental drift reported as reverted (order-independent: the store dir
+    // may be listed alongside it).
+    try std.testing.expect(std.mem.indexOf(u8, r, "reverted (incidental):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "  drift-file.txt") != null);
+    // Nothing skipped:
+    try std.testing.expect(std.mem.indexOf(u8, r, "skipped:\n  (none)") != null);
+    // The user's pre-existing untracked file survived untouched and unreported:
+    try std.testing.expect(fs.exists("user-notes.txt"));
+    try std.testing.expect(std.mem.indexOf(u8, r, "user-notes") == null);
+    try std.testing.expect(fs.exists("intentional-new.txt"));
+    try std.testing.expect(!fs.exists("drift-file.txt"));
 }

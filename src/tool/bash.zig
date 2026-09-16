@@ -100,17 +100,136 @@ pub const BashTool = struct {
 /// command must begin with `git` so incidental mentions (e.g. `echo "git push"`)
 /// are not mistaken for a real push.
 fn isUnauthorizedGitPush(cmd: []const u8) bool {
-    var it = std.mem.tokenizeScalar(u8, cmd, ' ');
-    const first = it.next() orelse return false;
-    if (!std.mem.eql(u8, first, "git")) return false;
-    var saw_push = false;
-    var dry_run = false;
-    while (it.next()) |tok| {
-        if (std.mem.eql(u8, tok, "push")) saw_push = true;
-        if (std.mem.eql(u8, tok, "--dry-run")) dry_run = true;
-    }
-    return saw_push and !dry_run;
+    return segmentCouldPush(cmd, 0);
 }
+
+/// Spec 016 (issue #19): resolve intent, not raw text. The command line is
+/// split on top-level compound separators (quote-aware); each segment is
+/// either a shell wrapper (`sh|bash|zsh|dash -c <script>` — recursed, depth
+/// capped) or analyzed as a `git` invocation. Unknown git subcommands fail
+/// closed (a configured alias could expand to a push).
+fn segmentCouldPush(seg: []const u8, depth: usize) bool {
+    if (depth > 3) return true; // nesting too deep — fail closed
+    var i: usize = 0;
+    var start: usize = 0;
+    var quote: u8 = 0;
+    while (i < seg.len) : (i += 1) {
+        const c = seg[i];
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            continue;
+        }
+        const compound = (c == '&' and i + 1 < seg.len and seg[i + 1] == '&') or
+            (c == '|' and i + 1 < seg.len and seg[i + 1] == '|') or
+            c == ';' or c == '|';
+        if (compound) {
+            if (analyzeSegment(seg[start..i], depth)) return true;
+            if (c == '&' or c == '|') i += 1;
+            start = i + 1;
+        }
+    }
+    return analyzeSegment(seg[start..], depth);
+}
+
+fn analyzeSegment(seg: []const u8, depth: usize) bool {
+    const trimmed = std.mem.trim(u8, seg, " \t\n\r");
+    if (trimmed.len == 0) return false;
+    if (shellWrapperScript(trimmed)) |inner| return segmentCouldPush(inner, depth + 1);
+    return gitSegmentPushes(trimmed);
+}
+
+/// `sh|bash|zsh|dash -c <script>`: returns the de-quoted script, else null.
+fn shellWrapperScript(seg: []const u8) ?[]const u8 {
+    var toks = SegTok{ .s = seg };
+    const first = toks.next() orelse return null;
+    const is_shell = std.mem.eql(u8, first, "sh") or std.mem.eql(u8, first, "bash") or
+        std.mem.eql(u8, first, "zsh") or std.mem.eql(u8, first, "dash");
+    if (!is_shell) return null;
+    var saw_c = false;
+    while (toks.next()) |t| {
+        if (std.mem.eql(u8, t, "-c")) {
+            saw_c = true;
+            continue;
+        }
+        if (saw_c) {
+            var inner = t;
+            if (inner.len >= 2 and (inner[0] == '\'' or inner[0] == '"') and inner[inner.len - 1] == inner[0]) {
+                inner = inner[1 .. inner.len - 1];
+            }
+            return inner;
+        }
+    }
+    return null;
+}
+
+fn gitSegmentPushes(seg: []const u8) bool {
+    var toks = SegTok{ .s = seg };
+    const first = toks.next() orelse return false;
+    if (!std.mem.eql(u8, first, "git")) return false;
+    var sub: ?[]const u8 = null;
+    var dry_run = false;
+    while (toks.next()) |t| {
+        if (sub == null) {
+            if (t.len > 0 and t[0] == '-') {
+                // Global options that consume a following value.
+                if (std.mem.eql(u8, t, "-C") or std.mem.eql(u8, t, "-c")) _ = toks.next();
+                continue;
+            }
+            sub = t;
+            continue;
+        }
+        if (std.mem.eql(u8, t, "--dry-run")) dry_run = true;
+    }
+    const s = sub orelse return false; // bare `git` — safe
+    if (std.mem.eql(u8, s, "push")) return !dry_run;
+    return !isKnownSafeGitSub(s);
+}
+
+/// Known subcommands that cannot reach a remote with new state. Anything not
+/// listed is treated as a possible alias for a push (fail closed).
+fn isKnownSafeGitSub(s: []const u8) bool {
+    const safe = [_][]const u8{
+        "status",   "log",     "diff",     "show",         "add",       "commit",
+        "mv",       "rm",      "stash",    "branch",       "tag",       "checkout",
+        "switch",   "restore", "merge",    "rebase",       "fetch",     "config",
+        "remote",   "blame",   "describe", "rev-parse",    "clean",     "apply",
+        "cherry-pick", "revert", "reset",  "grep",         "ls-files",  "ls-remote",
+        "worktree", "gc",      "fsck",     "notes",        "archive",   "bundle",
+        "cat-file", "check-ignore",       "init",         "clone",     "help",
+        "version",
+    };
+    for (safe) |k| {
+        if (std.mem.eql(u8, s, k)) return true;
+    }
+    return false;
+}
+
+/// Quote-aware whitespace tokenizer (quotes stay part of the token).
+const SegTok = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    fn next(self: *SegTok) ?[]const u8 {
+        while (self.i < self.s.len and (self.s[self.i] == ' ' or self.s[self.i] == '\t')) self.i += 1;
+        if (self.i >= self.s.len) return null;
+        const start = self.i;
+        while (self.i < self.s.len and self.s[self.i] != ' ' and self.s[self.i] != '\t') {
+            if (self.s[self.i] == '\'' or self.s[self.i] == '"') {
+                const q = self.s[self.i];
+                self.i += 1;
+                while (self.i < self.s.len and self.s[self.i] != q) self.i += 1;
+                if (self.i < self.s.len) self.i += 1;
+                continue;
+            }
+            self.i += 1;
+        }
+        return self.s[start..self.i];
+    }
+};
 
 /// Spawn the child, drain both stdout and stderr to EOF via `poll`, then reap
 /// with a single `child.wait()`. On timeout (and on the stop signal) the child
@@ -332,4 +451,44 @@ test "BashTool captures merged 2>&1 piped output" {
     }
     try std.testing.expect(r.ok);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "S100") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: bypass shapes (spec 016 US1, issue #19 Lane D).
+// ---------------------------------------------------------------------------
+
+test "push gate catches compound, wrapper and alias bypass shapes (A1)" {
+    const gated = [_][]const u8{
+        "cd repo && git push origin main", // compound: push in the second segment
+        "deploy && git push", // compound after another command
+        "sh -c 'git push origin main'", // shell wrapper
+        "bash -c \"git push\"", // wrapper, double quotes
+        "zsh -c 'cd x && git push'", // wrapper + compound inside the script
+        "git -C /srv/app push origin", // global option before the subcommand
+        "git deploy-all", // unknown subcommand: alias could expand to a push
+        "git -c http.extraHeader=x push", // -c consumes a value, then push
+        "git push origin main # safe comment", // push is still a push
+    };
+    for (gated) |cmd| {
+        if (!isUnauthorizedGitPush(cmd)) {
+            std.debug.print("BYPASS not caught: {s}\n", .{cmd});
+            return error.BypassNotCaught;
+        }
+    }
+
+    const allowed = [_][]const u8{
+        "git status",
+        "git log --oneline",
+        "git add -A && git commit -m x",
+        "git push --dry-run",
+        "echo git push",
+        "ls; git log",
+        "git commit -m 'msg says git push'",
+    };
+    for (allowed) |cmd| {
+        if (isUnauthorizedGitPush(cmd)) {
+            std.debug.print("SAFE command gated: {s}\n", .{cmd});
+            return error.SafeCommandGated;
+        }
+    }
 }
