@@ -108,11 +108,13 @@ fn goalSignalHandler(sig: std.c.SIG) callconv(.c) void {
     // std.process now.
     if (!g_goal_active.load(.acquire)) std.process.exit(130); // no run active: default die
     if (g_goal_stop_len == 0 or g_goal_stop_len >= g_goal_stop_path.len) return;
-    // Async-signal-safe: plain C open/close (std.posix.open is gone in 0.16).
+    // Async-signal-safe: raw openat + close (std.posix.open is gone in 0.16;
+    // std.posix keeps the syscall path libc-free, unlike std.c).
+    if (g_goal_stop_len >= g_goal_stop_path.len) return;
     g_goal_stop_path[g_goal_stop_len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&g_goal_stop_path);
-    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd >= 0) _ = std.c.close(fd);
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.posix.mode_t, 0o644)) catch return;
+    _ = std.posix.system.close(fd);
 }
 
 fn armGoalSignals(stop_path: []const u8) void {
