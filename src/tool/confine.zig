@@ -21,7 +21,12 @@ pub fn check(alloc: Allocator, fs: Fs, raw_path: []const u8) ?[]const u8 {
     if (raw_path[0] == '~') return refusalMsg(alloc, "path escapes workspace root: {s}", .{raw_path});
 
     if (std.fs.path.isAbsolute(raw_path)) {
-        if (!underRoot(root, raw_path))
+        // Collapse `..`/`.` lexically first so the verdict never depends on
+        // filesystem state (FakeFs realpath is unnormalized).
+        const norm = lexNormalize(alloc, raw_path) catch
+            return refusalMsg(alloc, "path escapes workspace root: {s}", .{raw_path});
+        defer alloc.free(norm);
+        if (!underRoot(root, norm))
             return refusalMsg(alloc, "path escapes workspace root: {s}", .{raw_path});
     } else {
         if (escapesLexically(raw_path))
@@ -33,8 +38,8 @@ pub fn check(alloc: Allocator, fs: Fs, raw_path: []const u8) ?[]const u8 {
     if (canonicalUnder(alloc, fs, root, raw_path)) |msg| return msg;
     if (std.fs.path.dirname(raw_path)) |parent| {
         if (canonicalUnder(alloc, fs, root, parent)) |msg| {
-            const joined = std.fmt.allocPrint(alloc, "{s} (parent {s})", .{ msg, parent }) catch msg;
-            return joined;
+            defer alloc.free(msg);
+            return std.fmt.allocPrint(alloc, "{s} (parent {s})", .{ msg, parent }) catch msg;
         }
     }
     return null;
@@ -62,6 +67,42 @@ fn escapesLexically(relative: []const u8) bool {
         }
     }
     return false;
+}
+
+/// Collapse `.` and `..` components lexically (absolute paths only).
+fn lexNormalize(alloc: Allocator, abs: []const u8) ![]u8 {
+    var out = try std.ArrayList(u8).initCapacity(alloc, 0);
+    errdefer out.deinit(alloc);
+    var it = std.mem.splitScalar(u8, abs, '/');
+    while (it.next()) |comp| {
+        if (comp.len == 0 or std.mem.eql(u8, comp, ".")) continue;
+        if (std.mem.eql(u8, comp, "..")) {
+            // Pop the last written component, never below the top.
+            while (out.items.len > 0 and out.items[out.items.len - 1] != '/') _ = out.pop();
+            if (out.items.len > 0) _ = out.pop();
+        } else {
+            try out.append(alloc, '/');
+            try out.appendSlice(alloc, comp);
+        }
+    }
+    if (out.items.len == 0) try out.append(alloc, '/');
+    return out.toOwnedSlice(alloc);
+}
+
+test "lexNormalize collapses interior dot components" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ "/wd/../outside", "/outside" },
+        .{ "/wd/./sub/../f.txt", "/wd/f.txt" },
+        .{ "/a/b/../../c", "/c" },
+        .{ "/..", "/" },
+        .{ "/", "/" },
+    };
+    inline for (cases) |case| {
+        const got = try lexNormalize(alloc, case[0]);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
 }
 
 /// Component-wise prefix test so `/wd2/x` is not confused with `/wd/x`.
@@ -125,6 +166,8 @@ test "confine refuses .. traversal and absolute paths outside the root (A1)" {
     try refusal(alloc, fs, "/"); // the root itself via absolute form outside cwd
     // Home shorthand leaves the workspace.
     try refusal(alloc, fs, "~/.ssh/id_rsa");
+    // Absolute paths with interior `..` collapse before the prefix test.
+    try refusal(alloc, fs, "/wd/../outside");
 }
 
 test "confine allows ordinary in-root paths (U1)" {
@@ -139,6 +182,7 @@ test "confine allows ordinary in-root paths (U1)" {
     try allowed(alloc, fs, "sub/../sibling.txt"); // stays inside after normalize
     // Absolute path under the cwd root is fine.
     try allowed(alloc, fs, "/wd/f.txt");
+    try allowed(alloc, fs, "/wd/./f.txt"); // interior `.` collapses
 }
 
 test "confine detects a symlink escape via realpath and fails closed (A2)" {

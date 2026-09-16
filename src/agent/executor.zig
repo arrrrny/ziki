@@ -1038,7 +1038,8 @@ test "GoalExecutor records a job report of changed files (FR-006)" {
     try std.testing.expect(std.mem.indexOf(u8, r, "skipped:\n  (none)") != null);
 }
 
-test "system prompt is unchanged when no skills listing is set (FR-010)" {    const alloc = std.testing.allocator;
+test "system prompt is unchanged when no skills listing is set (FR-010)" {
+    const alloc = std.testing.allocator;
     const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
     var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
     defer fake.deinit();

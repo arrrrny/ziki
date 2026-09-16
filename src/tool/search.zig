@@ -24,9 +24,9 @@ pub const SearchTool = struct {
     fn schema(_: *anyopaque) ToolSpec {
         return .{
             .name = "search_file",
-            .description = "Find lines in a file containing the given substring.",
+            .description = "Find lines containing the given substring, in `path` (single file) or recursively under `dir` (bounded by `max_files`).",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"}},"required":["path","pattern"]}
+                \\{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"dir":{"type":"string"},"max_files":{"type":"integer","minimum":1,"maximum":256}},"required":["pattern"],"anyOf":[{"required":["path"]},{"required":["dir"]}]}
             ,
         };
     }
@@ -43,8 +43,10 @@ pub const SearchTool = struct {
             if (@import("confine.zig").check(alloc, self.fs, parsed.value.dir)) |msg| {
                 return ToolResult{ .ok = false, .error_message = msg };
             }
-            var budget: usize = parsed.value.max_files;
-            try walkSearch(alloc, self.fs, parsed.value.dir, parsed.value.pattern, &budget, &out);
+            // FR-004: 256 is a hard cap, whatever the model sends.
+            var budget: usize = @min(parsed.value.max_files, 256);
+            var noticed = false;
+            try walkSearch(alloc, self.fs, parsed.value.dir, parsed.value.pattern, &budget, &noticed, &out, 0);
             return ToolResult{ .ok = true, .output = try out.toOwnedSlice(alloc) };
         }
 
@@ -72,14 +74,12 @@ pub const SearchTool = struct {
 
 /// Search one file under `path`; returns false when `path` is not a readable
 /// file (the caller then treats it as a directory and recurses). Decrements
-/// `budget` per file actually opened; at zero, appends a notice and stops.
+/// `budget` per file actually opened; never opens anything once it hits zero
+/// (the walk then stops and emits the limit notice once).
 fn searchOneFile(alloc: Allocator, fs: Fs, path: []const u8, pattern: []const u8, budget: *usize, out: *std.ArrayList(u8)) !bool {
+    if (budget.* == 0) return true;
     const content = fs.readFile(alloc, path) catch return false;
     defer alloc.free(content);
-    if (budget.* == 0) {
-        try out.appendSlice(alloc, "[search_file: file limit reached]\n");
-        return true;
-    }
     budget.* -= 1;
     var line_iter = std.mem.splitScalar(u8, content, '\n');
     var line_no: usize = 0;
@@ -92,17 +92,32 @@ fn searchOneFile(alloc: Allocator, fs: Fs, path: []const u8, pattern: []const u8
     return true;
 }
 
-fn walkSearch(alloc: Allocator, fs: Fs, dir: []const u8, pattern: []const u8, budget: *usize, out: *std.ArrayList(u8)) !void {
+fn walkSearch(alloc: Allocator, fs: Fs, dir: []const u8, pattern: []const u8, budget: *usize, noticed: *bool, out: *std.ArrayList(u8), depth: usize) !void {
+    // Depth cap: an in-root symlink cycle (a→b→a) must not recurse forever.
+    if (depth > 32) return;
     const entries = fs.readDir(alloc, dir) catch return;
     defer {
         for (entries) |e| alloc.free(e);
         alloc.free(entries);
     }
     for (entries) |e| {
+        if (budget.* == 0) {
+            // One-shot notice, then stop walking entirely.
+            if (!noticed.*) {
+                try out.appendSlice(alloc, "[search_file: file limit reached]\n");
+                noticed.* = true;
+            }
+            break;
+        }
         const child = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, e });
         defer alloc.free(child);
+        // Fail closed: the walk must not read what confinement refuses.
+        if (@import("confine.zig").check(alloc, fs, child)) |msg| {
+            alloc.free(msg);
+            continue;
+        }
         if (try searchOneFile(alloc, fs, child, pattern, budget, out)) continue;
-        try walkSearch(alloc, fs, child, pattern, budget, out);
+        try walkSearch(alloc, fs, child, pattern, budget, noticed, out, depth + 1);
     }
 }
 
@@ -143,4 +158,31 @@ test "SearchTool searches a directory recursively with a bound (A5)" {
     try std.testing.expect(std.mem.indexOf(u8, r2.output, "src/a.zig:1:") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.output, "src/sub/b.zig") == null);
     try std.testing.expect(std.mem.indexOf(u8, r2.output, "file limit") != null);
+}
+
+// Review hardening: the dir walk is confined like the single-file path — a
+// symlinked child pointing outside the root is skipped entirely, and an
+// in-root symlink cycle terminates via the depth cap instead of overflowing
+// the stack.
+test "SearchTool dir walk skips symlink escapes and survives symlink cycles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(abs);
+
+    var impl = @import("../fs/fs.zig").RealFs.init(abs);
+    var st = SearchTool.init(impl.toFs());
+    const t = st.toTool();
+
+    try tmp.dir.makePath("src");
+    try tmp.dir.writeFile(.{ .sub_path = "src/real.zig", .data = "needle here\n" });
+    try tmp.dir.symLink("/etc", "src/esc", .{}); // escape: refused, never read
+    try tmp.dir.symLink(".", "src/loop", .{}); // in-root cycle: depth-capped
+
+    const r = try t.execute(alloc, "{\"dir\":\"src\",\"pattern\":\"needle\"}");
+    defer alloc.free(r.output);
+    try std.testing.expect(r.ok);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "src/real.zig:1: needle here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "hosts") == null);
 }

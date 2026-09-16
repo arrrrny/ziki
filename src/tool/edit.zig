@@ -22,9 +22,9 @@ pub const EditTool = struct {
     fn schema(_: *anyopaque) ToolSpec {
         return .{
             .name = "edit_file",
-            .description = "Replace the first occurrence of `old` with `new` in a file. Fails if `old` is not found exactly once.",
+            .description = "Edit a file by `mode`: `replace` swaps the first occurrence of `old` with `new` (fails unless found exactly once), `create` makes a missing file with `new` as its content, `delete` removes the file.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}
+                \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"mode":{"type":"string","enum":["replace","create","delete"]}},"required":["path","mode","new"]}
             ,
         };
     }
@@ -62,6 +62,11 @@ pub const EditTool = struct {
         if (!std.mem.eql(u8, mode, "replace")) {
             return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file: unknown mode: {s}", .{mode}) };
         }
+        // The schema requires `old` for replace; the Args default must not let
+        // an omitted `old` silently "match" position 0 of an empty file.
+        if (parsed.value.old.len == 0) {
+            return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file replace: `old` is required", .{}) };
+        }
 
         const original = self.fs.readFile(alloc, parsed.value.path) catch |e| {
             return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file read failed: {s}", .{@errorName(e)}) };
@@ -74,7 +79,9 @@ pub const EditTool = struct {
         }
         const replaced = try std.mem.replaceOwned(u8, alloc, original, parsed.value.old, parsed.value.@"new");
         defer alloc.free(replaced);
-        try self.fs.writeFile(alloc, parsed.value.path, replaced);
+        self.fs.writeFile(alloc, parsed.value.path, replaced) catch |e| {
+            return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file write failed: {s}", .{@errorName(e)}) };
+        };
         return ToolResult{ .ok = true, .output = try std.fmt.allocPrint(alloc, "edited {s}", .{parsed.value.path}) };
     }
 };
@@ -136,4 +143,19 @@ test "EditTool delete mode removes a file and refuses a missing one (A4)" {
     defer alloc.free(r2.error_message.?);
     try std.testing.expect(!r2.ok);
     try std.testing.expect(std.mem.indexOf(u8, r2.error_message.?, "not found") != null);
+}
+
+// Review hardening: replace mode must not treat an omitted `old` (the Args
+// default "") as a 1-count match on an empty file.
+test "EditTool replace mode refuses an empty `old`" {
+    const alloc = std.testing.allocator;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+    try fake.writeFile(alloc, "empty.txt", "");
+    var et = EditTool.init(fake.toFs());
+    const t = et.toTool();
+    const r = try t.execute(alloc, "{\"path\":\"empty.txt\",\"mode\":\"replace\",\"new\":\"x\"}");
+    defer alloc.free(r.error_message.?);
+    try std.testing.expect(!r.ok);
+    try std.testing.expect(std.mem.indexOf(u8, r.error_message.?, "old") != null);
 }
