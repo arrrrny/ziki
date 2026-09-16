@@ -105,7 +105,7 @@ doesn't ship.
 ## BUILD
 
 ```bash
-zig build
+zig build            # requires Zig 0.16.x (project floor, spec 018)
 zig build test      # all green. no exceptions.
 ./zig-out/bin/ziki /goal "your objective" --provider cliproxy
 ./zig-out/bin/ziki resume [goal-id]   # continue a persisted goal from the store

@@ -26,7 +26,7 @@ pub const SearchTool = struct {
             .name = "search_file",
             .description = "Find lines in a file containing the given substring.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"}},"required":["path","pattern"]}
+            \\{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"}},"required":["path","pattern"]}
             ,
         };
     }
@@ -47,7 +47,7 @@ pub const SearchTool = struct {
         while (line_iter.next()) |line| {
             line_no += 1;
             if (std.mem.indexOf(u8, line, parsed.value.pattern) != null) {
-                try std.fmt.format(out.writer(alloc), "{d}: {s}\n", .{ line_no, line });
+                try out.print(alloc, "{d}: {s}\n", .{ line_no, line });
             }
         }
         return ToolResult{ .ok = true, .output = try out.toOwnedSlice(alloc) };

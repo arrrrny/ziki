@@ -24,13 +24,13 @@ pub const EditTool = struct {
             .name = "edit_file",
             .description = "Replace the first occurrence of `old` with `new` in a file. Fails if `old` is not found exactly once.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}
+            \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}
             ,
         };
     }
     fn execute(ctx: *anyopaque, alloc: Allocator, args_json: []const u8) !ToolResult {
         const self: *EditTool = @ptrCast(@alignCast(ctx));
-        const Args = struct { path: []const u8, old: []const u8, @"new": []const u8 };
+        const Args = struct { path: []const u8, old: []const u8, new: []const u8 };
         var parsed = try std.json.parseFromSlice(Args, alloc, args_json, .{});
         defer parsed.deinit();
 
@@ -43,7 +43,7 @@ pub const EditTool = struct {
         if (count != 1) {
             return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file expected exactly 1 match, found {d}", .{count}) };
         }
-        const replaced = try std.mem.replaceOwned(u8, alloc, original, parsed.value.old, parsed.value.@"new");
+        const replaced = try std.mem.replaceOwned(u8, alloc, original, parsed.value.old, parsed.value.new);
         defer alloc.free(replaced);
         try self.fs.writeFile(alloc, parsed.value.path, replaced);
         return ToolResult{ .ok = true, .output = try std.fmt.allocPrint(alloc, "edited {s}", .{parsed.value.path}) };

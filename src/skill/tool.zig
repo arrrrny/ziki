@@ -28,7 +28,7 @@ pub const SkillTool = struct {
             .name = "skill",
             .description = "Fetch the full instructions of a skill by name. The skills available to you are listed in the system prompt.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"name":{"type":"string","description":"Name of the skill whose full instructions should be fetched"}},"required":["name"]}
+            \\{"type":"object","properties":{"name":{"type":"string","description":"Name of the skill whose full instructions should be fetched"}},"required":["name"]}
             ,
         };
     }
@@ -54,15 +54,14 @@ pub const SkillTool = struct {
     fn notFoundMessage(self: *const SkillTool, alloc: Allocator, missing: []const u8) ![]u8 {
         var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
         errdefer buf.deinit(alloc);
-        const w = buf.writer(alloc);
-        try w.print("skill not found: {s}. available skills: ", .{missing});
+        try buf.print(alloc, "skill not found: {s}. available skills: ", .{missing});
         const skills = self.registry.list();
         if (skills.len == 0) {
-            try w.writeAll("(none)");
+            try buf.appendSlice(alloc, "(none)");
         } else {
             for (skills, 0..) |s, i| {
-                if (i > 0) try w.writeAll(", ");
-                try w.writeAll(s.name);
+                if (i > 0) try buf.appendSlice(alloc, ", ");
+                try buf.appendSlice(alloc, s.name);
             }
         }
         return buf.toOwnedSlice(alloc);

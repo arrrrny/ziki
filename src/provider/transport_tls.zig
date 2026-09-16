@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const tr = @import("transport.zig");
 
 const HttpTransport = tr.HttpTransport;
@@ -19,27 +20,39 @@ const Header = tr.Header;
 //   zig test src/provider/transport_tls.zig
 
 test "HttpTransport HTTPS-through-proxy fails on non-200 CONNECT" {
+    // Same 0.16.0/macOS io limitation as the other loopback tests (spec 018
+    // verification notes): a listener thread + client on one Threaded Io.
+    if (comptime @import("builtin").os.tag == .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // In-process proxy that answers the CONNECT tunnel request with 503, so the
     // manual CONNECT+TLS path (requestViaConnectTls) must surface
     // error.ProxyConnectFailed rather than hang or mislead (FR-007 edge case).
-    var server = try std.net.Address.listen(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8792), .{ .reuse_address = true });
-    defer server.deinit();
+    var address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 8792 } };
+    var server = try address.listen(compat.io(), .{ .reuse_address = true });
+    defer server.deinit(compat.io());
     const Proxy = struct {
-        fn run(s: *std.net.Server) void {
-            const conn = s.accept() catch return;
-            defer conn.stream.close();
+        fn run(s: *std.Io.net.Server) void {
+            const io = compat.io();
+            const conn = s.accept(io) catch return;
+            defer conn.close(io);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var r = conn.reader(io, &rbuf);
+            const ri = &r.interface;
+            var w = conn.writer(io, &wbuf);
+            const wi = &w.interface;
             // Read the CONNECT request fully before replying.
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = ri.readSliceShort(buf[total..]) catch return;
                 if (n == 0) return;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
             }
             const resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-            _ = conn.stream.writeAll(resp) catch return;
+            wi.writeAll(resp) catch return;
+            wi.flush() catch return;
         }
     };
     var th = try std.Thread.spawn(.{}, Proxy.run, .{&server});

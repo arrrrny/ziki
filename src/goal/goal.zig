@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 /// Lifecycle state of a goal (FR-003). Terminal states are completed/blocked/aborted.
 pub const Status = enum {
@@ -55,15 +56,15 @@ pub const Goal = struct {
     session_id: []const u8 = "",
 
     pub fn init(alloc: std.mem.Allocator, objective: []const u8, criterion: ?[]const u8, session_id: []const u8) !Goal {
-        const id = try std.fmt.allocPrint(alloc, "goal-{d}", .{std.time.nanoTimestamp()});
+        const id = try std.fmt.allocPrint(alloc, "goal-{d}", .{compat.nanoTimestamp()});
         return Goal{
             .id = id,
             .objective = try alloc.dupe(u8, objective),
             .criterion = if (criterion) |c| try alloc.dupe(u8, c) else null,
             .progress = try alloc.dupe(u8, ""),
             .session_id = try alloc.dupe(u8, session_id),
-            .created_at = std.time.timestamp(),
-            .updated_at = std.time.timestamp(),
+            .created_at = compat.timestamp(),
+            .updated_at = compat.timestamp(),
         };
     }
 

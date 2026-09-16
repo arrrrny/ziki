@@ -25,7 +25,7 @@ pub const WriteTool = struct {
             .name = "write_file",
             .description = "Create or overwrite a file at the given path with the given content.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"data":{"type":"string"}},"required":["path","data"]}
+            \\{"type":"object","properties":{"path":{"type":"string"},"data":{"type":"string"}},"required":["path","data"]}
             ,
         };
     }
