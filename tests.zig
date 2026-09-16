@@ -13,6 +13,7 @@ const openai = @import("src/provider/openai.zig");
 const fake = @import("src/provider/fake.zig");
 const presets = @import("src/provider/presets.zig");
 const tool = @import("src/tool/tool.zig");
+const confine = @import("src/tool/confine.zig");
 const read = @import("src/tool/read.zig");
 const edit = @import("src/tool/edit.zig");
 const search = @import("src/tool/search.zig");
@@ -46,6 +47,7 @@ test "aggregator loads all modules" {
     _ = fake;
     _ = presets;
     _ = tool;
+    _ = confine;
     _ = read;
     _ = edit;
     _ = search;

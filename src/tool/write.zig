@@ -34,6 +34,10 @@ pub const WriteTool = struct {
         const Args = struct { path: []const u8, data: []const u8 };
         var parsed = try std.json.parseFromSlice(Args, alloc, args_json, .{});
         defer parsed.deinit();
+        // Spec 015: structured refusal before any file access (fail closed).
+        if (@import("confine.zig").check(alloc, self.fs, parsed.value.path)) |msg| {
+            return ToolResult{ .ok = false, .error_message = msg };
+        }
         self.fs.writeFile(alloc, parsed.value.path, parsed.value.data) catch |e| {
             return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "write_file failed: {s}", .{@errorName(e)}) };
         };
