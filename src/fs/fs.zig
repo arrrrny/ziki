@@ -51,6 +51,9 @@ pub const Fs = struct {
         /// Direct entry names of a directory (no recursion, no file/dir
         /// distinction implied). Errors when the directory cannot be opened.
         read_dir: *const fn (ctx: *anyopaque, alloc: Allocator, path: []const u8) anyerror![][]const u8,
+        /// Canonical absolute path of `path` following symlinks (spec 015
+        /// confinement). Errors (FileNotFound) when the path does not exist.
+        realpath: *const fn (ctx: *anyopaque, alloc: Allocator, path: []const u8) anyerror![]u8,
     };
 
     pub fn readFile(self: Fs, alloc: Allocator, path: []const u8) ![]u8 {
@@ -73,6 +76,10 @@ pub const Fs = struct {
     pub fn readDir(self: Fs, alloc: Allocator, path: []const u8) ![][]const u8 {
         return self.vtable.read_dir(self.ctx, alloc, path);
     }
+    /// Canonical path of `path` with symlinks resolved (spec 015).
+    pub fn realpath(self: Fs, alloc: Allocator, path: []const u8) ![]u8 {
+        return self.vtable.realpath(self.ctx, alloc, path);
+    }
 };
 
 /// Real filesystem backed by std.fs, rooted at a working directory.
@@ -92,6 +99,7 @@ pub const RealFs = struct {
         .remove = remove,
         .cwd = cwd,
         .read_dir = readDir,
+        .realpath = realpath,
     };
 
     fn resolve(self: *RealFs, alloc: Allocator, path: []const u8) ![]u8 {
@@ -140,6 +148,12 @@ pub const RealFs = struct {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         return self.cwd_path;
     }
+    fn realpath(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![]u8 {
+        const self: *RealFs = @ptrCast(@alignCast(ctx));
+        const abs = try self.resolve(alloc, path);
+        defer alloc.free(abs);
+        return std.fs.cwd().realpathAlloc(alloc, abs);
+    }
     fn readDir(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![][]const u8 {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         const abs = try self.resolve(alloc, path);
@@ -179,6 +193,7 @@ pub const FakeFs = struct {
         .remove = remove,
         .cwd = cwd,
         .read_dir = readDirVt,
+        .realpath = realpathVt,
     };
 
     pub fn readFile(self: *FakeFs, alloc: Allocator, path: []const u8) ![]u8 {
@@ -231,6 +246,18 @@ pub const FakeFs = struct {
     fn cwd(ctx: *anyopaque) []const u8 {
         const self: *FakeFs = @ptrCast(@alignCast(ctx));
         return self.cwd_path;
+    }
+
+    /// Lexical canonicalization: absolute paths pass through, relative paths
+    /// join under `cwd_path` (the fake has no symlinks and no existence
+    /// requirement — spec 015 confinement only needs the lexical form here).
+    pub fn realpath(self: *FakeFs, alloc: Allocator, path: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(path)) return alloc.dupe(u8, path);
+        return std.fs.path.join(alloc, &.{ self.cwd_path, path });
+    }
+    fn realpathVt(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![]u8 {
+        const self: *FakeFs = @ptrCast(@alignCast(ctx));
+        return self.realpath(alloc, path);
     }
 
     /// Synthesizes the direct children of `path` from the flat file map: every
