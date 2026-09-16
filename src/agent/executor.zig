@@ -97,6 +97,26 @@ pub const GoalExecutor = struct {
     /// Move the goal into a terminal state: status + progress + publisher +
     /// persist. Conversation history is cleared for terminal goals so the
     /// session's next goal never replays a foreign transcript.
+    /// Spec 014 US3/US4: turn credential/model rejections into a blocked goal
+    /// with actionable text (no key material, gateway hint when available).
+    /// Returns true when `e` was handled and the goal is finished.
+    fn finishProviderBlocked(self: *GoalExecutor, goal: *Goal, e: anyerror) !bool {
+        switch (e) {
+            error.Unauthorized, error.Forbidden => {
+                try self.finish(goal, .blocked, "provider rejected credentials (401/403) — check your API key or quota", "provider rejected credentials", "provider rejected credentials (401/403)");
+                return true;
+            },
+            error.ModelNotFound => {
+                const hint = self.provider.errorHint() orelse "check the model id against the gateway's model list";
+                const msg = try std.fmt.allocPrint(self.alloc, "model rejected by gateway — available models: {s}", .{hint});
+                defer self.alloc.free(msg);
+                try self.finish(goal, .blocked, msg, msg, "model rejected by gateway");
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     fn finish(self: *GoalExecutor, goal: *Goal, status: @import("../goal/goal.zig").Status, progress: []const u8, publisher_msg: ?[]const u8, skip: ?[]const u8) !void {
         goal.status = status;
         if (self.publisher != null) {
@@ -297,6 +317,9 @@ pub const GoalExecutor = struct {
                 }
                 if (stopped or self.stopRequested()) return .aborted; // abort wins: discard
                 if (io.err) |e| {
+                    // Spec 014 US3/US4: credential and model rejections are
+                    // non-transient — no retry/backoff burn.
+                    if (e == error.Unauthorized or e == error.Forbidden or e == error.ModelNotFound) return e;
                     if (attempt + 1 == max_attempts) return e;
                     var slept: u64 = 0;
                     while (slept < 200) : (slept += poll_ms) {
@@ -478,7 +501,10 @@ pub const GoalExecutor = struct {
             if (self.verbose) logLine(self.alloc, "verbose: turn {d}: requesting model ({d} msgs)", .{ goal.used.turns, messages.items.len });
 
             const specs = try self.toolSpecs(a);
-            const outcome = try self.completeInterruptible(a, .{ .messages = messages.items, .tools = specs });
+            const outcome = self.completeInterruptible(a, .{ .messages = messages.items, .tools = specs }) catch |e| {
+                if (try self.finishProviderBlocked(goal, e)) return;
+                return e;
+            };
             const resp = switch (outcome) {
                 .aborted => {
                     // Abort wins: the in-flight (or late) response is discarded,
@@ -493,6 +519,16 @@ pub const GoalExecutor = struct {
             // Token accounting (spec 013 D2): reported usage when the backend
             // supplies it, estimated conversation cost otherwise.
             goal.used.tokens += if (resp.usage) |u| u.total() else estimateTokens(messages.items);
+
+            // Spec 014 US2: surface non-terminal finish reasons so a truncated
+            // or cut-off turn is never silently treated as a complete stop.
+            switch (resp.finish_reason) {
+                .length => try self.addSkip("model output truncated (finish_reason=length)"),
+                .unknown => try self.addSkip("unknown finish_reason reported by the backend"),
+                .tool_calls => if (resp.message.tool_calls == null or resp.message.tool_calls.?.len == 0)
+                    try self.addSkip("tool call cut off (finish_reason=tool_calls without calls)"),
+                .stop => {},
+            }
 
             if (self.verbose) {
                 if (resp.message.tool_calls) |tcs| {
@@ -1664,4 +1700,160 @@ test "resume round-trip through the store continues an interrupted goal (B18)" {
         // Transcript cleared at terminal so the next goal starts clean.
         try std.testing.expect((try repo2.loadHistory(alloc, reloaded.id)) == null);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: finish_reason surfacing + credential/model rejection handling
+// (spec 014 US2/US3/US4, issue #17 Lane B).
+// ---------------------------------------------------------------------------
+
+const StubOutcome = union(enum) {
+    ok: provider.ChatResponse,
+    err: anyerror,
+};
+
+/// Scripted provider returning a fixed outcome per call (repeats the last);
+/// counts calls so the test can assert no retry burn; optional error hint.
+const StubProvider = struct {
+    outcomes: []const StubOutcome,
+    idx: usize = 0,
+    calls: usize = 0,
+    hint: ?[]const u8 = null,
+
+    fn init(outcomes: []const StubOutcome) StubProvider {
+        return .{ .outcomes = outcomes };
+    }
+    fn toProvider(self: *StubProvider) provider.Provider {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = provider.Provider.VTable{ .complete = complete, .name = name, .error_hint = errorHint };
+
+    fn name(_: *anyopaque) []const u8 {
+        return "stub";
+    }
+    fn errorHint(ctx: *anyopaque) ?[]const u8 {
+        const self: *StubProvider = @ptrCast(@alignCast(ctx));
+        return self.hint;
+    }
+    fn complete(ctx: *anyopaque, alloc: Allocator, _: provider.CompletionRequest) anyerror!provider.ChatResponse {
+        const self: *StubProvider = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const o = self.outcomes[@min(self.idx, self.outcomes.len - 1)];
+        if (self.idx + 1 < self.outcomes.len) self.idx += 1;
+        switch (o) {
+            .err => |e| return e,
+            .ok => |r| {
+                var tcs: ?[]provider.ToolCall = null;
+                if (r.message.tool_calls) |src| {
+                    const owned = try alloc.alloc(provider.ToolCall, src.len);
+                    for (src, 0..) |tc, i| {
+                        owned[i] = .{
+                            .id = try alloc.dupe(u8, tc.id),
+                            .name = try alloc.dupe(u8, tc.name),
+                            .arguments_json = try alloc.dupe(u8, tc.arguments_json),
+                        };
+                    }
+                    tcs = owned;
+                }
+                return .{ .message = .{ .role = r.message.role, .content = try alloc.dupe(u8, r.message.content), .tool_calls = tcs }, .finish_reason = r.finish_reason };
+            },
+        }
+    }
+};
+
+const StubHarness = struct {
+    fake: *(@import("../fs/fs.zig").FakeFs),
+    repo_impl: *(@import("../goal/repository.zig").FsGoalRepository),
+    ex: *GoalExecutor,
+    goal: *@import("../goal/goal.zig").Goal,
+
+    fn deinit(self: *StubHarness, alloc: Allocator) void {
+        self.goal.deinit(alloc);
+        alloc.destroy(self.goal);
+        if (self.ex.report) |r| alloc.free(r);
+        alloc.destroy(self.ex);
+        alloc.destroy(self.repo_impl);
+        self.fake.deinit();
+        alloc.destroy(self.fake);
+    }
+};
+
+fn runStubGoal(alloc: Allocator, sp: *StubProvider) !StubHarness {
+    const FakeFs = @import("../fs/fs.zig").FakeFs;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    const fake = try alloc.create(FakeFs);
+    fake.* = FakeFs.init(alloc, "/wd");
+    const tools = [_]Tool{};
+    const repo_impl = try alloc.create(FsGoalRepository);
+    repo_impl.* = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const ex = try alloc.create(GoalExecutor);
+    ex.* = GoalExecutor{
+        .alloc = alloc,
+        .provider = sp.toProvider(),
+        .tools = &tools,
+        .repo = repo_impl.toRepository(),
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    const goal = try alloc.create(@import("../goal/goal.zig").Goal);
+    goal.* = try @import("../goal/goal.zig").Goal.init(alloc, "stub objective", null, "sess1");
+    return .{ .fake = fake, .repo_impl = repo_impl, .ex = ex, .goal = goal };
+}
+
+test "finish_reason length/unknown/tool-cutoff are surfaced, not silent stops (A2)" {
+    const alloc = std.testing.allocator;
+    // Truncated answer: surfaced as a job-report note, loop still terminates.
+    {
+        const outs = [_]StubOutcome{.{ .ok = .{ .message = .{ .role = .assistant, .content = "partial" }, .finish_reason = .length } }};
+        var sp = StubProvider.init(&outs);
+        var g = try runStubGoal(alloc, &sp);
+        defer g.deinit(alloc);
+        try g.ex.run(g.goal);
+        try std.testing.expect(g.goal.status == .completed);
+        try std.testing.expect(std.mem.indexOf(u8, g.ex.report.?, "truncated") != null);
+    }
+    // Unknown finish_reason: distinct state, surfaced.
+    {
+        const outs = [_]StubOutcome{.{ .ok = .{ .message = .{ .role = .assistant, .content = "hm" }, .finish_reason = .unknown } }};
+        var sp = StubProvider.init(&outs);
+        var g = try runStubGoal(alloc, &sp);
+        defer g.deinit(alloc);
+        try g.ex.run(g.goal);
+        try std.testing.expect(std.mem.indexOf(u8, g.ex.report.?, "unknown finish_reason") != null);
+    }
+    // Tool-call cutoff: finish_reason says tool_calls but no calls arrived.
+    {
+        const outs = [_]StubOutcome{.{ .ok = .{ .message = .{ .role = .assistant, .content = "" }, .finish_reason = .tool_calls } }};
+        var sp = StubProvider.init(&outs);
+        var g = try runStubGoal(alloc, &sp);
+        defer g.deinit(alloc);
+        try g.ex.run(g.goal);
+        try std.testing.expect(std.mem.indexOf(u8, g.ex.report.?, "cut off") != null);
+    }
+}
+
+test "credential rejection finishes blocked, fail-fast, no key material (A3)" {
+    const alloc = std.testing.allocator;
+    const outs = [_]StubOutcome{.{ .err = error.Unauthorized }};
+    var sp = StubProvider.init(&outs);
+    var g = try runStubGoal(alloc, &sp);
+    defer g.deinit(alloc);
+    try g.ex.run(g.goal);
+    try std.testing.expect(g.goal.status == .blocked);
+    try std.testing.expect(std.mem.indexOf(u8, g.goal.progress, "credentials") != null);
+    try std.testing.expectEqual(@as(usize, 1), sp.calls); // no retry burn
+}
+
+test "model rejection finishes blocked including the gateway hint (A4)" {
+    const alloc = std.testing.allocator;
+    const outs = [_]StubOutcome{.{ .err = error.ModelNotFound }};
+    var sp = StubProvider.init(&outs);
+    sp.hint = "m-a, m-b";
+    var g = try runStubGoal(alloc, &sp);
+    defer g.deinit(alloc);
+    try g.ex.run(g.goal);
+    try std.testing.expect(g.goal.status == .blocked);
+    try std.testing.expect(std.mem.indexOf(u8, g.goal.progress, "m-a, m-b") != null);
+    try std.testing.expectEqual(@as(usize, 1), sp.calls);
 }

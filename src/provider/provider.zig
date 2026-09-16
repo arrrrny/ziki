@@ -45,11 +45,15 @@ pub const FinishReason = enum {
     stop,
     tool_calls,
     length,
+    /// The backend reported a finish_reason this client does not know
+    /// (spec 014 US2): surfaced to the caller, never silently `.stop`.
+    unknown,
 
     pub fn fromJson(s: []const u8) FinishReason {
         if (std.mem.eql(u8, s, "tool_calls")) return .tool_calls;
         if (std.mem.eql(u8, s, "length")) return .length;
-        return .stop;
+        if (std.mem.eql(u8, s, "stop")) return .stop;
+        return .unknown;
     }
 };
 
@@ -96,6 +100,10 @@ pub const Provider = struct {
     pub const VTable = struct {
         complete: *const fn (ctx: *anyopaque, alloc: Allocator, req: CompletionRequest) anyerror!ChatResponse,
         name: *const fn (ctx: *anyopaque) []const u8,
+        /// Optional (spec 014 US4): the last error-path hint (e.g. the
+        /// gateway's available-models list after a ModelNotFound). Null when
+        /// the provider has none — default for fakes.
+        error_hint: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     };
 
     pub fn complete(self: Provider, alloc: Allocator, req: CompletionRequest) !ChatResponse {
@@ -104,10 +112,18 @@ pub const Provider = struct {
     pub fn name(self: Provider) []const u8 {
         return self.vtable.name(self.ctx);
     }
+    pub fn errorHint(self: Provider) ?[]const u8 {
+        const f = self.vtable.error_hint orelse return null;
+        return f(self.ctx);
+    }
 };
 
 test "Role/FinishReason json mapping" {
     try std.testing.expectEqualStrings("assistant", Role.assistant.jsonString());
     try std.testing.expect(FinishReason.fromJson("tool_calls") == .tool_calls);
-    try std.testing.expect(FinishReason.fromJson("other") == .stop);
+    try std.testing.expect(FinishReason.fromJson("length") == .length);
+    try std.testing.expect(FinishReason.fromJson("stop") == .stop);
+    // Spec 014 US2: unknown values are surfaced, never silently `.stop`.
+    try std.testing.expect(FinishReason.fromJson("other") == .unknown);
+    try std.testing.expect(FinishReason.fromJson("") == .unknown);
 }
