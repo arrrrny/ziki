@@ -68,13 +68,19 @@ pub const BashTool = struct {
         defer parsed.deinit();
 
         // FR-002: refuse an unauthorized remote `git push` instead of executing.
-        if (!self.allow_push and isUnauthorizedGitPush(parsed.value.command)) {
-            self.push_blocked = true;
-            return ToolResult{
-                .ok = false,
-                .error_message = try std.fmt.allocPrint(alloc,
-                    "run_command blocked: `git push` to a remote requires authorization (re-run with --allow-push)", .{}),
-            };
+        if (!self.allow_push) {
+            const g = classifyGitPush(parsed.value.command);
+            if (g.gated()) {
+                self.push_blocked = true;
+                const msg = switch (g.verdict) {
+                    // Review (safe-list gaps): an unknown subcommand deserves
+                    // its own message — "git push" misdescribes the command.
+                    .push => try std.fmt.allocPrint(alloc, "run_command blocked: `git push` to a remote requires authorization (re-run with --allow-push)", .{}),
+                    .unknown_sub => try std.fmt.allocPrint(alloc, "run_command blocked: unknown git subcommand `{s}` — possible push alias; requires authorization (re-run with --allow-push)", .{g.sub orelse "?"}),
+                    .safe => unreachable,
+                };
+                return ToolResult{ .ok = false, .error_message = msg };
+            }
         }
 
         var argv = [_][]const u8{ "/bin/sh", "-c", parsed.value.command };
@@ -95,49 +101,132 @@ pub const BashTool = struct {
     }
 };
 
-/// True when `cmd` is a `git push` that would reach a remote and is not a
-/// dry-run. Used to gate pushes behind explicit authorization (FR-002). The
-/// command must begin with `git` so incidental mentions (e.g. `echo "git push"`)
-/// are not mistaken for a real push.
+/// True when `cmd` would run a `git push` that reaches a remote and is not a
+/// dry-run. Used to gate pushes behind explicit authorization (FR-002).
+/// Intent is resolved shell-style, so incidental mentions (e.g. `echo "git
+/// push"`) are not mistaken for a real push.
 fn isUnauthorizedGitPush(cmd: []const u8) bool {
+    return segmentCouldPush(cmd, 0).gated();
+}
+
+/// Full verdict with the offending subcommand, for the block message
+/// (a definite push vs an unknown git subcommand that could be a push alias).
+fn classifyGitPush(cmd: []const u8) Gate {
     return segmentCouldPush(cmd, 0);
 }
 
+/// Outcome of intent analysis for a command line: `safe` (allow),
+/// `unknown_sub` (unrecognized git subcommand — fail closed) or `push`
+/// (definite push). `sub` names the offending subcommand when known.
+const Gate = struct {
+    verdict: enum { safe, unknown_sub, push } = .safe,
+    sub: ?[]const u8 = null,
+
+    /// Keep the stronger of the two verdicts (safe < unknown_sub < push).
+    fn merge(self: *Gate, other: Gate) void {
+        if (@intFromEnum(other.verdict) > @intFromEnum(self.verdict)) self.* = other;
+    }
+    fn gated(self: Gate) bool {
+        return self.verdict != .safe;
+    }
+    /// Nesting too deep or an unextractable surface — treat as a push.
+    fn failClosed() Gate {
+        return .{ .verdict = .push };
+    }
+};
+
 /// Spec 016 (issue #19): resolve intent, not raw text. The command line is
-/// split on top-level compound separators (quote-aware); each segment is
-/// either a shell wrapper (`sh|bash|zsh|dash -c <script>` — recursed, depth
-/// capped) or analyzed as a `git` invocation. Unknown git subcommands fail
-/// closed (a configured alias could expand to a push).
-fn segmentCouldPush(seg: []const u8, depth: usize) bool {
-    if (depth > 3) return true; // nesting too deep — fail closed
+/// split on top-level separators (quote-aware: `&&`, `||`, `;`, `|`, `&`,
+/// and newline — everything `/bin/sh -c` treats as a command boundary); each
+/// segment is either a shell wrapper (`sh|bash|zsh|dash -c <script>` —
+/// recursed, depth capped) or analyzed as a `git` invocation. Command
+/// substitution bodies (`$( … )`, backticks — including inside double quotes,
+/// where the shell still substitutes) are recursed the same way; a body that
+/// cannot be extracted fails closed. Unknown git subcommands fail closed
+/// (a configured alias could expand to a push).
+fn segmentCouldPush(seg: []const u8, depth: usize) Gate {
+    if (depth > 3) return Gate.failClosed(); // nesting too deep — fail closed
+    var g = Gate{};
     var i: usize = 0;
     var start: usize = 0;
     var quote: u8 = 0;
     while (i < seg.len) : (i += 1) {
         const c = seg[i];
         if (quote != 0) {
-            if (c == quote) quote = 0;
+            if (c == quote) {
+                quote = 0;
+            } else if (quote == '"') {
+                // Inside double quotes command substitution still executes.
+                if (c == '`') {
+                    const close = std.mem.indexOfScalarPos(u8, seg, i + 1, '`') orelse return Gate.failClosed();
+                    g.merge(segmentCouldPush(seg[i + 1 .. close], depth + 1));
+                    if (g.gated()) return g;
+                    i = close;
+                } else if (c == '$' and i + 1 < seg.len and seg[i + 1] == '(') {
+                    const end = substitutionEnd(seg, i, depth) orelse return Gate.failClosed();
+                    i = end - 1;
+                }
+            }
             continue;
         }
         if (c == '\'' or c == '"') {
             quote = c;
             continue;
         }
+        // A backticked body runs wherever it appears (outside single quotes).
+        if (c == '`') {
+            const close = std.mem.indexOfScalarPos(u8, seg, i + 1, '`') orelse return Gate.failClosed();
+            g.merge(segmentCouldPush(seg[i + 1 .. close], depth + 1));
+            if (g.gated()) return g;
+            i = close;
+            continue;
+        }
+        // `$( … )` runs wherever it appears (POSIX command substitution).
+        if (c == '$' and i + 1 < seg.len and seg[i + 1] == '(') {
+            const end = substitutionEnd(seg, i, depth) orelse return Gate.failClosed();
+            i = end - 1;
+            continue;
+        }
         const compound = (c == '&' and i + 1 < seg.len and seg[i + 1] == '&') or
             (c == '|' and i + 1 < seg.len and seg[i + 1] == '|') or
-            c == ';' or c == '|';
+            c == ';' or c == '|' or c == '\n' or c == '&';
         if (compound) {
-            if (analyzeSegment(seg[start..i], depth)) return true;
-            if (c == '&' or c == '|') i += 1;
+            g.merge(analyzeSegment(seg[start..i], depth));
+            if (g.gated()) return g;
+            // Skip only the second char of a doubled operator; a lone `&`
+            // starts the next segment right after it.
+            if (c != '\n' and i + 1 < seg.len and seg[i + 1] == c) i += 1;
             start = i + 1;
         }
     }
-    return analyzeSegment(seg[start..], depth);
+    g.merge(analyzeSegment(seg[start..], depth));
+    return g;
 }
 
-fn analyzeSegment(seg: []const u8, depth: usize) bool {
+/// The `$( … )` body at `i` (`seg[i] == '$'`, `seg[i + 1] == '('`) executes:
+/// recurse into it (same fail-closed cap as the wrapper recursion) and return
+/// the index just past the closing `)`. Null means the caller must gate —
+/// the body could not be extracted (unterminated) or could push.
+fn substitutionEnd(seg: []const u8, i: usize, depth: usize) ?usize {
+    var d: usize = 1;
+    var j = i + 2;
+    while (j < seg.len) : (j += 1) {
+        if (seg[j] == '(') {
+            d += 1;
+        } else if (seg[j] == ')') {
+            d -= 1;
+            if (d == 0) {
+                if (segmentCouldPush(seg[i + 2 .. j], depth + 1).gated()) return null;
+                return j + 1;
+            }
+        }
+    }
+    return null; // unterminated — fail closed
+}
+
+fn analyzeSegment(seg: []const u8, depth: usize) Gate {
     const trimmed = std.mem.trim(u8, seg, " \t\n\r");
-    if (trimmed.len == 0) return false;
+    if (trimmed.len == 0) return Gate{};
     if (shellWrapperScript(trimmed)) |inner| return segmentCouldPush(inner, depth + 1);
     return gitSegmentPushes(trimmed);
 }
@@ -146,8 +235,8 @@ fn analyzeSegment(seg: []const u8, depth: usize) bool {
 fn shellWrapperScript(seg: []const u8) ?[]const u8 {
     var toks = SegTok{ .s = seg };
     const first = toks.next() orelse return null;
-    const is_shell = std.mem.eql(u8, first, "sh") or std.mem.eql(u8, first, "bash") or
-        std.mem.eql(u8, first, "zsh") or std.mem.eql(u8, first, "dash");
+    const is_shell = wordIs(first, "sh") or wordIs(first, "bash") or
+        wordIs(first, "zsh") or wordIs(first, "dash");
     if (!is_shell) return null;
     var saw_c = false;
     while (toks.next()) |t| {
@@ -166,10 +255,25 @@ fn shellWrapperScript(seg: []const u8) ?[]const u8 {
     return null;
 }
 
-fn gitSegmentPushes(seg: []const u8) bool {
+fn gitSegmentPushes(seg: []const u8) Gate {
     var toks = SegTok{ .s = seg };
-    const first = toks.next() orelse return false;
-    if (!std.mem.eql(u8, first, "git")) return false;
+    var first = toks.next() orelse return Gate{};
+    // Shell word semantics: assignment prefixes (`FOO=bar cmd`) and
+    // pass-through commands (`env`, `command`, `nohup`) still exec the
+    // following program.
+    while (true) {
+        if (isAssignmentPrefix(first)) {
+            first = toks.next() orelse return Gate{}; // assignment with no command — safe
+            continue;
+        }
+        if (wordIs(first, "env") or wordIs(first, "command") or wordIs(first, "nohup")) {
+            first = toks.next() orelse return Gate{};
+            if (first.len > 0 and first[0] == '-') return Gate.failClosed(); // `env -i …` — unresolved form
+            continue;
+        }
+        break;
+    }
+    if (!wordIs(first, "git")) return Gate{};
     var sub: ?[]const u8 = null;
     var dry_run = false;
     while (toks.next()) |t| {
@@ -184,9 +288,34 @@ fn gitSegmentPushes(seg: []const u8) bool {
         }
         if (std.mem.eql(u8, t, "--dry-run")) dry_run = true;
     }
-    const s = sub orelse return false; // bare `git` — safe
-    if (std.mem.eql(u8, s, "push")) return !dry_run;
-    return !isKnownSafeGitSub(s);
+    const s = sub orelse return Gate{}; // bare `git` — safe
+    if (wordIs(s, "push")) {
+        if (dry_run) return Gate{};
+        return .{ .verdict = .push };
+    }
+    if (!isKnownSafeGitSub(s)) return .{ .verdict = .unknown_sub, .sub = s };
+    return Gate{};
+}
+
+/// Shell word semantics (review: program-name match): quotes never change a
+/// word's letters and a path's basename is the program — `'git'`, `g"it"`,
+/// `/usr/bin/git` all exec git.
+fn wordIs(tok: []const u8, name: []const u8) bool {
+    const base = if (std.mem.lastIndexOfScalar(u8, tok, '/')) |sl| tok[sl + 1 ..] else tok;
+    var n: usize = 0;
+    for (base) |c| {
+        if (c == '\'' or c == '"') continue;
+        if (n >= name.len or name[n] != c) return false;
+        n += 1;
+    }
+    return n == name.len;
+}
+
+/// `NAME=value` environment assignment before a command (the shell assigns,
+/// then execs the rest).
+fn isAssignmentPrefix(tok: []const u8) bool {
+    if (tok.len == 0 or tok[0] == '-' or tok[0] == '=') return false;
+    return std.mem.indexOfScalar(u8, tok, '=') != null;
 }
 
 /// Known subcommands that cannot reach a remote with new state. Anything not
@@ -200,7 +329,9 @@ fn isKnownSafeGitSub(s: []const u8) bool {
         "cherry-pick", "revert", "reset",  "grep",         "ls-files",  "ls-remote",
         "worktree", "gc",      "fsck",     "notes",        "archive",   "bundle",
         "cat-file", "check-ignore",       "init",         "clone",     "help",
-        "version",
+        "version",  "reflog",  "merge-base", "shortlog",   "bisect",    "submodule",
+        "ls-tree",  "rev-list", "show-branch", "symbolic-ref", "whatchanged",
+        "format-patch", "difftool", "var",  "count-objects", "maintenance",
     };
     for (safe) |k| {
         if (std.mem.eql(u8, s, k)) return true;
@@ -468,6 +599,24 @@ test "push gate catches compound, wrapper and alias bypass shapes (A1)" {
         "git deploy-all", // unknown subcommand: alias could expand to a push
         "git -c http.extraHeader=x push", // -c consumes a value, then push
         "git push origin main # safe comment", // push is still a push
+        // Review follow-ups (spec 016): the same gate must hold for the other
+        // top-level separators and for shell word semantics.
+        "echo hi & git push origin main", // lone `&` backgrounds, then pushes
+        "set -e\ngit push origin main", // newline is a command separator
+        "'git' push origin main", // quoted program name
+        "g\"it\" push origin main", // partially quoted program name
+        "/usr/bin/git push origin main", // the basename is the program
+        "env git push origin main", // pass-through prefix
+        "command git push origin main",
+        "nohup git push origin main",
+        "FOO=bar git push origin main", // assignment prefix
+        "env VAR=1 git push origin main",
+        "\"bash\" -c 'git push origin main'", // quoted wrapper program name
+        "echo $(git push origin main)", // command substitution body
+        "echo `git push origin main`", // backtick body
+        "git commit -m \"hi $(git push origin main)\"", // substitution inside double quotes
+        "bash <<'EOF'\ngit push origin main\nEOF", // heredoc body runs
+        "echo $(git push", // unterminated substitution — fail closed
     };
     for (gated) |cmd| {
         if (!isUnauthorizedGitPush(cmd)) {
@@ -484,6 +633,15 @@ test "push gate catches compound, wrapper and alias bypass shapes (A1)" {
         "echo git push",
         "ls; git log",
         "git commit -m 'msg says git push'",
+        // Safe substitution and suppressed substitution stay allowed.
+        "git commit -m \"fix $(date)\"",
+        "git commit -m 'literal $(git push)'",
+        // Newly safe-listed local subcommands must not be gated.
+        "git reflog",
+        "git merge-base HEAD~1 HEAD",
+        "git submodule status",
+        "git rev-list --count HEAD",
+        "git count-objects",
     };
     for (allowed) |cmd| {
         if (isUnauthorizedGitPush(cmd)) {
@@ -491,4 +649,17 @@ test "push gate catches compound, wrapper and alias bypass shapes (A1)" {
             return error.SafeCommandGated;
         }
     }
+}
+
+test "unknown git subcommand blocks with a push-alias message" {
+    const alloc = std.testing.allocator;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    var bt = BashTool.init(fake.toFs(), false, 600);
+    const t = bt.toTool();
+    const r = try t.execute(alloc, "{\"command\":\"git deploy-all\"}");
+    defer if (r.error_message) |e| alloc.free(e);
+    try std.testing.expect(!r.ok);
+    try std.testing.expect(bt.push_blocked);
+    try std.testing.expect(std.mem.indexOf(u8, r.error_message.?, "unknown git subcommand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.error_message.?, "deploy-all") != null);
 }

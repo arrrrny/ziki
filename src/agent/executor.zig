@@ -372,21 +372,34 @@ pub const GoalExecutor = struct {
     /// during the completion — the caller maps that to the graceful abort.
     /// Verification goes through the same interruptible completion as the
     /// main path so `/stop` is observed during its I/O too (it can be the
-    /// longest single wait of the run).
-    fn verify(self: *GoalExecutor, a: Allocator, messages: *std.ArrayList(provider.ChatMessage), criterion: []const u8) !?bool {
+    /// longest single wait of the run). The completion is budget-accounted
+    /// like any provider turn (review: verify calls were silently free).
+    /// With `strict` the reply must be exactly `yes` (case-insensitive,
+    /// whitespace-trimmed) to count as satisfied — used by the
+    /// already-applied pre-check, where a chatty reply that merely contains
+    /// "YES" must not complete the goal without any work.
+    fn verify(self: *GoalExecutor, a: Allocator, goal: *Goal, messages: *std.ArrayList(provider.ChatMessage), criterion: []const u8, strict: bool) !?bool {
         try messages.append(a, .{ .role = .user, .content = try a.dupe(u8, try std.fmt.allocPrint(a, "Criterion: {s}\nIs it satisfied? Reply with exactly YES or NO.", .{criterion})) });
         const outcome = try self.completeInterruptible(a, .{ .messages = messages.items, .tools = &[0]provider.ToolSpec{} });
         const resp = switch (outcome) {
             .aborted => return null,
             .resp => |r| r,
         };
+        goal.used.turns += 1;
+        goal.used.tokens += if (resp.usage) |u| u.total() else estimateTokens(messages.items);
         const content = resp.message.content;
         if (self.verbose) logLine(self.alloc, "verbose: verify -> {s}", .{content});
         try messages.append(a, .{ .role = .assistant, .content = try a.dupe(u8, content) });
         const upper = try std.ascii.allocUpperString(a, content);
-        const yes = std.mem.indexOf(u8, upper, "YES") != null;
-        a.free(upper);
-        return yes;
+        defer a.free(upper);
+        if (strict) {
+            // Hold the call to its own prompt ("exactly YES or NO"): only a
+            // bare yes short-circuits; anything else falls into the loop,
+            // where end-of-run verification is the safety net.
+            const trimmed = std.mem.trim(u8, upper, " \t\r\n");
+            return std.mem.eql(u8, trimmed, "YES");
+        }
+        return std.mem.indexOf(u8, upper, "YES") != null;
     }
 
     /// Run the goal to a terminal state (completed / blocked / aborted),
@@ -457,9 +470,12 @@ pub const GoalExecutor = struct {
         // Spec 016 (issue #19): already-applied detection — one cheap
         // verification call before any provider turn. Only for fresh goals
         // (a resumed transcript already reflects the work done so far).
+        // Strict: the model has zero workspace observations here, so a bare
+        // yes is required — anything chatty runs the normal loop (and the
+        // call is budget-accounted like any turn).
         if (goal.criterion != null and history.len == 0) {
-            if ((try self.verify(a, &messages, goal.criterion.?)) orelse false) {
-                try self.finish(goal, .completed, "already done: criterion satisfied before starting", "already satisfied", "criterion already satisfied — no provider turns needed");
+            if ((try self.verify(a, goal, &messages, goal.criterion.?, true)) orelse false) {
+                try self.finish(goal, .completed, "already done: criterion satisfied before starting", "already satisfied", "criterion already satisfied — no work turns needed (1 pre-check call)");
                 return;
             }
         }
@@ -559,7 +575,7 @@ pub const GoalExecutor = struct {
             }
 
             if (goal.criterion) |crit| {
-                const satisfied = (try self.verify(a, &messages, crit)) orelse {
+                const satisfied = (try self.verify(a, goal, &messages, crit, false)) orelse {
                     // Stop observed during verification I/O: same graceful
                     // abort as the main path.
                     if (self.stop_path) |p| self.fs.remove(p) catch {};
@@ -1724,9 +1740,10 @@ test "already-satisfied criterion short-circuits before provider turns (A2)" {
     var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
     defer fake.deinit();
 
-    // The pre-check IS the only model call: it answers YES immediately.
+    // The pre-check IS the only model call: it answers exactly YES (strict —
+    // a chatty reply that merely contains "YES" would not short-circuit).
     const responses = [_]provider.ChatResponse{
-        .{ .message = .{ .role = .assistant, .content = "YES — nothing to do" } },
+        .{ .message = .{ .role = .assistant, .content = "YES" } },
     };
     var cp = CountingProvider.init(&responses);
     const fp = cp.toProvider();
@@ -1750,7 +1767,10 @@ test "already-satisfied criterion short-circuits before provider turns (A2)" {
 
     try std.testing.expect(goal.status == .completed);
     try std.testing.expect(std.mem.indexOf(u8, goal.progress, "already done") != null);
-    try std.testing.expectEqual(@as(usize, 1), cp.calls); // the pre-check only — no turns burned
+    try std.testing.expectEqual(@as(usize, 1), cp.calls); // the pre-check only — no work turns burned
+    // The pre-check call is budget-accounted (review: it was silently free).
+    try std.testing.expectEqual(@as(u32, 1), goal.used.turns);
+    try std.testing.expect(goal.used.tokens > 0);
     try std.testing.expect(std.mem.indexOf(u8, ex.report.?, "already satisfied") != null);
 }
 
@@ -1792,6 +1812,52 @@ test "unmet criterion still runs the normal loop after the pre-check (A2)" {
     defer if (ex.report) |r| alloc.free(r);
 
     // Pre-check said NO, then the loop ran to completion.
+    try std.testing.expect(goal.status == .completed);
+    try std.testing.expect(std.mem.indexOf(u8, goal.progress, "already done") == null);
+    const content = try fake.readFile(alloc, "hello.txt");
+    defer alloc.free(content);
+    try std.testing.expectEqualStrings("hi", content);
+}
+
+test "pre-check accepts only a bare YES — a chatty reply runs the loop (A2)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"hello.txt\",\"data\":\"hi\"}" }};
+    // The pre-check reply CONTAINS "YES" but is not a bare yes: with zero
+    // workspace observations it is a guess, so the goal must NOT complete as
+    // already done — the normal loop runs and does the work.
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "NO — YES would require running the suite first" } },
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "done" } },
+        .{ .message = .{ .role = .assistant, .content = "YES now" } },
+    };
+    var cp = CountingProvider.init(&responses);
+    const fp = cp.toProvider();
+
+    const WriteTool = @import("../tool/write.zig").WriteTool;
+    var wt_impl = WriteTool.init(fake.toFs());
+    const write_t = wt_impl.toTool();
+    const tools = [_]Tool{write_t};
+    var repo_impl = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try @import("../goal/goal.zig").Goal.init(alloc, "write hello", "hello.txt exists with hi", "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
     try std.testing.expect(goal.status == .completed);
     try std.testing.expect(std.mem.indexOf(u8, goal.progress, "already done") == null);
     const content = try fake.readFile(alloc, "hello.txt");
