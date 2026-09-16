@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const Fs = @import("../fs/fs.zig").Fs;
 
 /// Injectable "should the goal loop stop?" observation (spec 013 D5).
@@ -56,17 +57,17 @@ pub const AtomicProbe = struct {
 /// a stop that appears *during* a long-running command.
 pub const DelayedProbe = struct {
     delay_ms: i64,
-    start_ms: i64 = std.time.milliTimestamp(),
+    start_ms: i64 = compat.milliTimestamp(),
 
     pub fn probe(self: *DelayedProbe) StopProbe {
         return .{ .ctx = self, .check = check };
     }
     pub fn reset(self: *DelayedProbe) void {
-        self.start_ms = std.time.milliTimestamp();
+        self.start_ms = compat.milliTimestamp();
     }
     fn check(ctx: *anyopaque) bool {
         const self: *DelayedProbe = @ptrCast(@alignCast(ctx));
-        return std.time.milliTimestamp() - self.start_ms >= self.delay_ms;
+        return compat.milliTimestamp() - self.start_ms >= self.delay_ms;
     }
 };
 

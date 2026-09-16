@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const provider = @import("provider.zig");
 const fake = @import("fake.zig");
 const presets = @import("presets.zig");
@@ -8,7 +9,6 @@ const openai = @import("openai.zig");
 /// End-to-end provider tests. Offline tests use FakeProvider/FakeTransport so
 /// the suite is deterministic. A single gated live test pings the configured
 /// provider when ZIKI_API_KEY is set; it skips silently otherwise.
-
 const CompletionRequest = provider.CompletionRequest;
 const ChatMessage = provider.ChatMessage;
 const ChatResponse = provider.ChatResponse;
@@ -26,7 +26,7 @@ test "e2e: FakeProvider drives a scripted completion turn" {
     var fp = fake.FakeProvider.init(&rs);
     const p = fp.toProvider();
     const req: CompletionRequest = .{
-        .messages = &[_]ChatMessage{ msg(.user, "hi") },
+        .messages = &[_]ChatMessage{msg(.user, "hi")},
         .tools = &[_]ToolSpec{},
     };
     const r = try p.complete(std.testing.allocator, req);
@@ -51,7 +51,7 @@ test "e2e: FakeProvider emits tool_calls and preserves call ids" {
     var fp = fake.FakeProvider.init(&rs);
     const p = fp.toProvider();
     const req: CompletionRequest = .{
-        .messages = &[_]ChatMessage{ msg(.user, "read the file") },
+        .messages = &[_]ChatMessage{msg(.user, "read the file")},
         .tools = &[_]ToolSpec{},
     };
     const r = try p.complete(std.testing.allocator, req);
@@ -90,7 +90,7 @@ test "e2e: FlakyProvider recovers after transient failures" {
     var fp = fake.FlakyProvider.init(3, ok);
     const p = fp.toProvider();
     const req: CompletionRequest = .{
-        .messages = &[_]ChatMessage{ msg(.user, "x") },
+        .messages = &[_]ChatMessage{msg(.user, "x")},
         .tools = &[_]ToolSpec{},
     };
     try std.testing.expectError(error.ProviderError, p.complete(std.testing.allocator, req));
@@ -115,7 +115,7 @@ test "e2e: OpenAIProvider round-trips a request through FakeTransport" {
     );
     const pr = p.toProvider();
     const req: CompletionRequest = .{
-        .messages = &[_]ChatMessage{ msg(.user, "ping") },
+        .messages = &[_]ChatMessage{msg(.user, "ping")},
         .tools = &[_]ToolSpec{},
         .budget_tokens = 8,
     };
@@ -128,11 +128,11 @@ test "e2e: OpenAIProvider round-trips a request through FakeTransport" {
 // Live connectivity test. Runs only when ZIKI_API_KEY is set, so CI without
 // secrets stays green. Prints nothing about the key itself.
 test "e2e: live provider responds to a trivial completion (gated)" {
-    const api_key = std.posix.getenv("ZIKI_API_KEY") orelse return error.SkipZigTest;
+    const api_key = compat.getenv("ZIKI_API_KEY") orelse return error.SkipZigTest;
     // The Kilo API is at /api/gateway, not /v1 — the /v1 path serves the
     // marketing site and 404s. Override ZIKI_ENDPOINT for other providers.
-    const endpoint = std.posix.getenv("ZIKI_ENDPOINT") orelse "https://api.kilo.ai/api/gateway";
-    const model = std.posix.getenv("ZIKI_MODEL") orelse "nex-agi/nex-n2.5-pro:free";
+    const endpoint = compat.getenv("ZIKI_ENDPOINT") orelse "https://api.kilo.ai/api/gateway";
+    const model = compat.getenv("ZIKI_MODEL") orelse "nex-agi/nex-n2.5-pro:free";
     var real_t = try transport.HttpTransport.init(std.testing.allocator, null);
     defer real_t.deinit();
     const t = real_t.toTransport();

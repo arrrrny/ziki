@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("compat.zig");
 
 const config = @import("config/config.zig");
 const presets = @import("provider/presets.zig");
@@ -40,7 +41,7 @@ const Output = @import("shell/repl.zig").Output;
 /// of a side-by-side swarm), else the historical `"default"` so single-instance
 /// behavior is unchanged. The returned slice is owned by `alloc`.
 fn resolveSessionId(alloc: Allocator) ![]u8 {
-    return resolveSessionIdFrom(alloc, std.posix.getenv("ZIKI_SESSION_ID"), std.posix.getenv("HERDR_PANE_ID")) catch |err| {
+    return resolveSessionIdFrom(alloc, compat.getenv("ZIKI_SESSION_ID"), compat.getenv("HERDR_PANE_ID")) catch |err| {
         if (err == error.InvalidSessionId) try emitErr("invalid session id — ZIKI_SESSION_ID / HERDR_PANE_ID must not contain path separators");
         return err;
     };
@@ -70,12 +71,14 @@ fn dupSessionId(alloc: Allocator, id: []const u8) ![]u8 {
 fn emit(comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(std.heap.page_allocator, fmt ++ "\n", args);
     defer std.heap.page_allocator.free(s);
-    try std.fs.File.stdout().writeAll(s);
+    try std.Io.File.stdout().writeStreamingAll(compat.io(), s);
 }
 fn emitErr(msg: []const u8) !void {
-    try std.fs.File.stdout().writeAll("error: ");
-    try std.fs.File.stdout().writeAll(msg);
-    try std.fs.File.stdout().writeAll("\n");
+    const out = std.Io.File.stdout();
+    const io = compat.io();
+    try out.writeStreamingAll(io, "error: ");
+    try out.writeStreamingAll(io, msg);
+    try out.writeStreamingAll(io, "\n");
 }
 fn emitStatus(status: Status) !void {
     try emit("status: {s}", .{status.jsonString()});
@@ -99,12 +102,19 @@ var g_goal_stop_path: [512]u8 = undefined;
 var g_goal_stop_len: usize = 0;
 var g_goal_active = std.atomic.Value(bool).init(false);
 
-fn goalSignalHandler(sig: i32) callconv(.c) void {
+fn goalSignalHandler(sig: std.c.SIG) callconv(.c) void {
     _ = sig;
-    if (!g_goal_active.load(.acquire)) std.posix.exit(130); // no run active: default die
-    if (g_goal_stop_len == 0) return;
-    const fd = std.posix.open(g_goal_stop_path[0..g_goal_stop_len], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return;
-    std.posix.close(fd);
+    // 0.16: the Sigaction handler takes the system SIG enum; exit lives on
+    // std.process now.
+    if (!g_goal_active.load(.acquire)) std.process.exit(130); // no run active: default die
+    if (g_goal_stop_len == 0 or g_goal_stop_len >= g_goal_stop_path.len) return;
+    // Async-signal-safe: raw openat + close (std.posix.open is gone in 0.16;
+    // std.posix keeps the syscall path libc-free, unlike std.c).
+    if (g_goal_stop_len >= g_goal_stop_path.len) return;
+    g_goal_stop_path[g_goal_stop_len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&g_goal_stop_path);
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.posix.mode_t, 0o644)) catch return;
+    _ = std.posix.system.close(fd);
 }
 
 fn armGoalSignals(stop_path: []const u8) void {
@@ -142,7 +152,7 @@ fn sessionProviderPath(alloc: Allocator, state_dir: []const u8) ![]u8 {
 fn readSessionProvider(alloc: Allocator, state_dir: []const u8) !?[]const u8 {
     const p = try sessionProviderPath(alloc, state_dir);
     defer alloc.free(p);
-    const raw = std.fs.cwd().readFileAlloc(alloc, p, 256) catch return null;
+    const raw = std.Io.Dir.cwd().readFileAlloc(compat.io(), p, alloc, .limited(256)) catch return null;
     const trimmed = std.mem.trim(u8, raw, "\r\n");
     if (trimmed.len == 0) {
         alloc.free(raw);
@@ -155,7 +165,7 @@ fn readSessionProvider(alloc: Allocator, state_dir: []const u8) !?[]const u8 {
 fn writeSessionProvider(alloc: Allocator, state_dir: []const u8, name: []const u8) !void {
     const p = try sessionProviderPath(alloc, state_dir);
     defer alloc.free(p);
-    try std.fs.cwd().writeFile(.{ .sub_path = p, .data = name });
+    try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = p, .data = name });
 }
 
 // ---------------------------------------------------------------------------
@@ -163,14 +173,15 @@ fn writeSessionProvider(alloc: Allocator, state_dir: []const u8, name: []const u
 // so the dispatcher stays command-agnostic (SC-005, DIP).
 // ---------------------------------------------------------------------------
 
-/// AnyWriter that emits to stdout (fd 1). Used by the Herdr state publisher to
-/// write the `[ziki-state: ...]` screen marker and OSC title. `std.fs.File`
-/// lacks the new `Writer.any()` helper, so we build the `AnyWriter` directly.
-fn stdoutWriteFn(_: *const anyopaque, bytes: []const u8) anyerror!usize {
-    return std.fs.File.stdout().write(bytes);
+/// Sink that emits to stdout (fd 1). Used by the Herdr state publisher to
+/// write the `[ziki-state: ...]` screen marker and OSC title (0.16 has no
+/// AnyWriter; the publisher takes the codebase's `state.Sink` vtable).
+fn stdoutSinkWriteFn(_: *anyopaque, bytes: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(compat.io(), bytes) catch {};
 }
-fn stdoutAnyWriter() std.io.AnyWriter {
-    return .{ .context = undefined, .writeFn = stdoutWriteFn };
+var stdout_sink_ctx: u8 = 0;
+fn stdoutSink() state.Sink {
+    return .{ .ctx = &stdout_sink_ctx, .writeFn = stdoutSinkWriteFn };
 }
 
 /// Build the Herdr `StatePublisher` for a goal (spec 011, FR-008).
@@ -191,7 +202,7 @@ fn buildStatePublisher(
     state_dir: []const u8,
     herdr_client_slot: *?herdr.HerdrHttpClient,
     herdr_socket_slot: *?*socket_transport.SocketTransport,
-    writer: std.io.AnyWriter,
+    writer: state.Sink,
 ) !state.StatePublisher {
     var reporter: ?state.HerdrReporter = null;
     if (pane_id) |_| {
@@ -425,7 +436,6 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sessio
     // Spec 011: wire the Herdr state publisher. `buildStatePublisher` reads
     // HERDR_PANE_ID and builds a real reporter when present, or a null-reporter
     // publisher (screen markers + OSC only) when absent (FR-008).
-    const stdout_writer = stdoutAnyWriter();
     var herdr_client_slot: ?herdr.HerdrHttpClient = null;
     // The client owns its URL copy (issue #20 bug 1); free it when the run ends.
     defer if (herdr_client_slot) |*c| c.deinit();
@@ -436,7 +446,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sessio
         sock.deinit();
         alloc.destroy(sock);
     };
-    ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), std.posix.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, &herdr_socket_slot, stdout_writer);
+    ex.publisher = try buildStatePublisher(alloc, transport.toTransport(), compat.getenv("HERDR_PANE_ID"), goal.id, state_dir, &herdr_client_slot, &herdr_socket_slot, stdoutSink());
 
     try emitStatus(.active);
     // Ctrl-C / SIGTERM during a goal run abort gracefully via the stop file.
@@ -464,7 +474,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sessio
 fn runStop(alloc: Allocator, state_dir: []const u8, session_id: []const u8) !void {
     const p = try std.fmt.allocPrint(alloc, "{s}/stop.{s}", .{ state_dir, session_id });
     defer alloc.free(p);
-    std.fs.cwd().writeFile(.{ .sub_path = p, .data = "" }) catch {
+    std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = p, .data = "" }) catch {
         try emitErr("could not write stop signal");
         return;
     };
@@ -631,7 +641,7 @@ fn runResume(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sess
     goal.status = .active;
     alloc.free(goal.progress);
     goal.progress = try alloc.dupe(u8, "resumed");
-    goal.updated_at = std.time.timestamp();
+    goal.updated_at = @intCast(std.Io.Clock.real.now(compat.io()).toSeconds());
 
     try emit("resuming goal {s}: {s}", .{ goal.id, goal.objective });
     try emit("  turns: {d}/{d}  tokens: {d}  elapsed: {d}s", .{ goal.used.turns, goal.budgets.max_turns, goal.used.tokens, goal.used.seconds });
@@ -799,18 +809,15 @@ const help_vtable = Handler.VTable{ .handle = helpHandle };
 
 var stdout_ctx: u8 = 0;
 fn stdoutWrite(_: *anyopaque, data: []const u8) void {
-    std.fs.File.stdout().writeAll(data) catch {};
+    std.Io.File.stdout().writeStreamingAll(compat.io(), data) catch {};
 }
 const stdout_output = Output{ .ctx = &stdout_ctx, .vtable = &.{ .write = stdoutWrite } };
 
-fn stdinRead(ctx: *std.fs.File, buf: []u8) error{}!usize {
-    return ctx.read(buf) catch 0;
-}
-
 fn runRepl(alloc: Allocator, dispatcher: *Dispatcher) !void {
-    var stdin_file = std.fs.File.stdin();
-    const stdin = std.io.GenericReader(*std.fs.File, error{}, stdinRead){ .context = &stdin_file };
-    try Repl.run(alloc, stdin, stdout_output, dispatcher, "ziki> ");
+    var stdin_file = std.Io.File.stdin();
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = stdin_file.readerStreaming(compat.io(), &stdin_buf);
+    try Repl.run(alloc, &stdin_reader.interface, stdout_output, dispatcher, "ziki> ");
 }
 
 fn usage() !void {
@@ -825,19 +832,27 @@ fn usage() !void {
     try emit("  ziki            (interactive REPL)", .{});
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-    defer _ = gpa.deinit();
+pub fn main(env: std.process.Init) !void {
+    // 0.16: start.zig hands us the process environment (Io + environ map) and
+    // a leak-checked gpa; there is no GeneralPurposeAllocator to build here.
+    compat.init(env);
+    const alloc = env.gpa;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    var arg_list = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+    defer {
+        for (arg_list.items) |a| alloc.free(a);
+        arg_list.deinit(alloc);
+    }
+    var arg_it = std.process.Args.Iterator.initAllocator(env.minimal.args, alloc) catch std.process.Args.Iterator.init(env.minimal.args);
+    defer arg_it.deinit();
+    while (arg_it.next()) |a| try arg_list.append(alloc, try alloc.dupe(u8, a));
+    const args: []const []const u8 = arg_list.items;
 
-    const cwd = try std.process.getCwdAlloc(alloc);
+    const cwd = try std.process.currentPathAlloc(compat.io(), alloc);
     defer alloc.free(cwd);
     const state_dir = try std.fs.path.join(alloc, &.{ cwd, ".ziki" });
     defer alloc.free(state_dir);
-    std.fs.cwd().makePath(state_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(compat.io(), state_dir) catch {};
 
     // Issue #20 bug 2: per-window session identity, resolved once and shared
     // by the goal, stop, status, and goals commands.
@@ -927,9 +942,9 @@ test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null other
     var slot: ?herdr.HerdrHttpClient = null;
     var sock_slot: ?*socket_transport.SocketTransport = null;
     var wbuf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&wbuf);
-    const w = fbs.writer().any();
-    const with = try buildStatePublisher(alloc, t, "pane-9", "goal-9", "/wd", &slot, &sock_slot, w);
+    var w = std.Io.Writer.fixed(&wbuf);
+    var wsink = state.WriterSink{ .w = &w };
+    const with = try buildStatePublisher(alloc, t, "pane-9", "goal-9", "/wd", &slot, &sock_slot, wsink.sink());
     try std.testing.expect(with.reporter != null);
     try std.testing.expect(slot != null); // client retained for the run's lifetime
     if (slot) |*c| c.deinit();
@@ -940,16 +955,17 @@ test "buildStatePublisher wires real reporter when HERDR_PANE_ID set, null other
 
     var slot2: ?herdr.HerdrHttpClient = null;
     var sock_slot2: ?*socket_transport.SocketTransport = null;
-    var without = try buildStatePublisher(alloc, t, null, "goal-10", "/wd", &slot2, &sock_slot2, w);
+    var without = try buildStatePublisher(alloc, t, null, "goal-10", "/wd", &slot2, &sock_slot2, wsink.sink());
     try std.testing.expect(without.reporter == null);
     try std.testing.expect(slot2 == null);
 
     // The no-reporter publisher is still safe to publish (degraded mode).
     var buf: [256]u8 = undefined;
-    var fbs2 = std.io.fixedBufferStream(&buf);
-    without.writer = fbs2.writer().any();
+    var w2 = std.Io.Writer.fixed(&buf);
+    var wsink2 = state.WriterSink{ .w = &w2 };
+    without.writer = wsink2.sink();
     without.publish(.working, null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..fbs2.pos], "[ziki-state: working]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "[ziki-state: working]") != null);
 }
 
 test "resume guard classifications (B17)" {

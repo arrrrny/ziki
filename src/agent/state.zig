@@ -57,11 +57,36 @@ pub const HerdrReporter = struct {
     }
 };
 
+/// Byte sink for the screen marker + OSC title (0.16 has no AnyWriter; this
+/// mirrors the codebase's vtable DI idiom so state.zig stays Io-free).
+pub const Sink = struct {
+    ctx: *anyopaque,
+    writeFn: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+
+    pub fn write(self: Sink, bytes: []const u8) void {
+        self.writeFn(self.ctx, bytes);
+    }
+};
+
+/// `Sink` backed by any `std.Io.Writer` (tests capture the marker/OSC output
+/// in a `std.Io.Writer.fixed` buffer; production points it at stdout).
+pub const WriterSink = struct {
+    w: *std.Io.Writer,
+
+    pub fn write(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *WriterSink = @ptrCast(@alignCast(ctx));
+        self.w.writeAll(bytes) catch {};
+    }
+    pub fn sink(self: *WriterSink) Sink {
+        return .{ .ctx = self, .writeFn = write };
+    }
+};
+
 /// Owns the state-publication side-effects (FR-002/003/004/007/008).
 pub const StatePublisher = struct {
     alloc: Allocator,
     reporter: ?HerdrReporter,
-    writer: std.io.AnyWriter,
+    writer: Sink,
     pane_id: []const u8,
     source: []const u8,
     agent: []const u8,
@@ -72,7 +97,7 @@ pub const StatePublisher = struct {
     pub fn init(
         alloc: Allocator,
         reporter: ?HerdrReporter,
-        writer: std.io.AnyWriter,
+        writer: Sink,
         pane_id: []const u8,
         session_id: []const u8,
         session_path: []const u8,
@@ -118,10 +143,10 @@ pub const StatePublisher = struct {
             .{ s, msg_part },
         ) catch return;
         defer self.alloc.free(marker);
-        self.writer.writeAll(marker) catch {};
+        self.writer.write(marker);
         const osc = std.fmt.allocPrint(self.alloc, "\x1b]2;ziki:{s}\x07", .{s}) catch return;
         defer self.alloc.free(osc);
-        self.writer.writeAll(osc) catch {};
+        self.writer.write(osc);
     }
 };
 
@@ -179,10 +204,21 @@ fn freeParams(alloc: Allocator, p: PaneReportParams) void {
 // implementation lands.
 // ---------------------------------------------------------------------------
 
-fn captureWriter(alloc: Allocator, buf: []u8) std.io.FixedBufferStream([]u8) {
-    _ = alloc;
-    return std.io.fixedBufferStream(buf);
+var sink_buf: [2048]u8 = undefined;
+var sink_writer = std.Io.Writer.fixed(&sink_buf);
+
+/// Fixed-buffer sink for tests: `sink_writer.buffered()` holds what was written.
+fn captureWriter() void {
+    sink_writer = std.Io.Writer.fixed(&sink_buf);
 }
+
+var test_wsink = WriterSink{ .w = &sink_writer };
+
+const TestSink = struct {
+    fn sink() Sink {
+        return test_wsink.sink();
+    }
+};
 
 test "AgentState.toHerdr maps to Herdr states (FR-005)" {
     try std.testing.expectEqualStrings("Idle", AgentState.idle.toHerdr());
@@ -195,9 +231,8 @@ test "AgentState.unknown maps to Unknown (FR-005 boundary)" {
 }
 
 test "StatePublisher.publish pushes correct PaneReportParams (FR-002)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "goal-1", "/wd/.ziki");
@@ -214,9 +249,8 @@ test "StatePublisher.publish pushes correct PaneReportParams (FR-002)" {
 }
 
 test "StatePublisher seq is strictly increasing (SC-006)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "g", "/wd");
@@ -230,80 +264,74 @@ test "StatePublisher seq is strictly increasing (SC-006)" {
 }
 
 test "StatePublisher emits screen marker [ziki-state: <state>] (FR-003)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "g", "/wd");
     sp.publish(.working, null);
-    const written = buf[0..fbs.pos];
+    const written = sink_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
 }
 
 test "StatePublisher emits OSC title ziki:<state> (FR-004)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "g", "/wd");
     sp.publish(.blocked, null);
-    const written = buf[0..fbs.pos];
+    const written = sink_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "ziki:blocked") != null);
 }
 
 test "StatePublisher marker includes message when present, omits when absent (FR-003/FR-004)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "g", "/wd");
     sp.publish(.working, null);
-    const a = buf[0..fbs.pos];
+    const a = sink_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, a, "[ziki-state: working]") != null);
     try std.testing.expect(std.mem.indexOf(u8, a, "[ziki-state: working] ") == null);
     sp.publish(.blocked, "criterion not satisfied");
-    const b = buf[0..fbs.pos];
+    const b = sink_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, b, "[ziki-state: blocked] criterion not satisfied") != null);
 }
 
 test "StatePublisher with null reporter still emits marker, no push, no crash (FR-008)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var sp = StatePublisher.init(std.testing.allocator, null, w, "pane-1", "g", "/wd");
     sp.publish(.working, null);
-    const written = buf[0..fbs.pos];
+    const written = sink_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
 }
 
 test "StatePublisher swallows reporter error and still emits marker (FR-008)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     fake.fail_next = true;
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "g", "/wd");
     // Must not panic/crash:
     sp.publish(.working, null);
-    const written = buf[0..fbs.pos];
+    const written = sink_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
 }
 
 test "StatePublisher push is authoritative and consistent with marker (FR-007)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-1", "g", "/wd");
     const states = [_]AgentState{ .idle, .working, .blocked };
     for (states) |s| {
         sp.publish(s, null);
-        const written = buf[0..fbs.pos];
+        const written = sink_writer.buffered();
         const pushed = (fake.last orelse @panic("no report")).state;
         const needle = try std.fmt.allocPrint(std.testing.allocator, "[ziki-state: {s}]", .{pushed});
         defer std.testing.allocator.free(needle);
@@ -312,9 +340,8 @@ test "StatePublisher push is authoritative and consistent with marker (FR-007)" 
 }
 
 test "FakeHerdrReporter records last params and can be forced to fail (U13)" {
-    var buf: [1024]u8 = undefined;
-    var fbs = captureWriter(std.testing.allocator, &buf);
-    const w = fbs.writer().any();
+    captureWriter();
+    const w = TestSink.sink();
     var fake = FakeHerdrReporter.init(std.testing.allocator);
     defer fake.deinit();
     var sp = StatePublisher.init(std.testing.allocator, fake.toReporter(), w, "pane-9", "sid-9", "/wd");

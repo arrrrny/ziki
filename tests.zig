@@ -1,6 +1,7 @@
 // Test aggregator. Importing each module pulls in its `test` declarations so
 // `zig build test` runs the whole suite. Add executor/cli/main as they land.
 const std = @import("std");
+const compat = @import("src/compat.zig");
 const fs = @import("src/fs/fs.zig");
 const goal = @import("src/goal/goal.zig");
 const repository = @import("src/goal/repository.zig");
@@ -34,6 +35,7 @@ const e2e = @import("src/provider/e2e_test.zig");
 
 test "aggregator loads all modules" {
     _ = std.testing;
+    _ = compat;
     _ = fs;
     _ = goal;
     _ = repository;

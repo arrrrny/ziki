@@ -71,39 +71,38 @@ pub const OpenAIProvider = struct {
 
 fn buildRequestBody(alloc: Allocator, model: []const u8, messages: []const provider.ChatMessage, tools: []const provider.ToolSpec) ![]u8 {
     var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
-    var w = buf.writer(alloc);
-    try w.print("{{\"model\":{f},\"messages\":[", .{std.json.fmt(model, .{})});
+    try buf.print(alloc, "{{\"model\":{f},\"messages\":[", .{std.json.fmt(model, .{})});
     for (messages, 0..) |m, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.print("{{\"role\":{f},\"content\":{f}", .{ std.json.fmt(m.role.jsonString(), .{}), std.json.fmt(m.content, .{}) });
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.print(alloc, "{{\"role\":{f},\"content\":{f}", .{ std.json.fmt(m.role.jsonString(), .{}), std.json.fmt(m.content, .{}) });
         if (m.tool_calls) |tcs| {
-            try w.writeAll(",\"tool_calls\":[");
+            try buf.appendSlice(alloc, ",\"tool_calls\":[");
             for (tcs, 0..) |tc, j| {
-                if (j > 0) try w.writeByte(',');
-                try w.print("{{\"id\":{f},\"type\":\"function\",\"function\":{{\"name\":{f},\"arguments\":{f}}}}}", .{
+                if (j > 0) try buf.append(alloc, ',');
+                try buf.print(alloc, "{{\"id\":{f},\"type\":\"function\",\"function\":{{\"name\":{f},\"arguments\":{f}}}}}", .{
                     std.json.fmt(tc.id, .{}),
                     std.json.fmt(tc.name, .{}),
                     std.json.fmt(tc.arguments_json, .{}),
                 });
             }
-            try w.writeByte(']');
+            try buf.append(alloc, ']');
         }
         if (m.tool_call_id) |id| {
-            try w.print(",\"tool_call_id\":{f}", .{std.json.fmt(id, .{})});
+            try buf.print(alloc, ",\"tool_call_id\":{f}", .{std.json.fmt(id, .{})});
         }
-        try w.writeByte('}');
+        try buf.append(alloc, '}');
     }
-    try w.writeAll("],\"tools\":[");
+    try buf.appendSlice(alloc, "],\"tools\":[");
     for (tools, 0..) |t, i| {
-        if (i > 0) try w.writeByte(',');
+        if (i > 0) try buf.append(alloc, ',');
         // parameters_json_schema is already a JSON object string; embed raw.
-        try w.print("{{\"type\":\"function\",\"function\":{{\"name\":{f},\"description\":{f},\"parameters\":{s}}}}}", .{
+        try buf.print(alloc, "{{\"type\":\"function\",\"function\":{{\"name\":{f},\"description\":{f},\"parameters\":{s}}}}}", .{
             std.json.fmt(t.name, .{}),
             std.json.fmt(t.description, .{}),
             t.parameters_json_schema,
         });
     }
-    try w.writeAll("],\"tool_choice\":\"auto\"}");
+    try buf.appendSlice(alloc, "],\"tool_choice\":\"auto\"}");
     return buf.toOwnedSlice(alloc);
 }
 

@@ -19,71 +19,38 @@ pub const Output = struct {
     }
 };
 
-/// Read one line (without trailing newline) from any reader exposing a
-/// `read(buffer) usize!usize` method (returns 0 at end of stream). `leftover`
-/// carries bytes read but not yet consumed across calls (a single physical
-/// read may contain several lines); the caller owns and frees it.
+/// Read one line (without trailing newline) from the reader. 0.16 removed the
+/// old `std.io` reader plumbing; the loop speaks `std.Io.Reader` directly, so
+/// buffering is the reader's job (the former `leftover` mechanism is gone).
 /// Returns `null` at end of stream.
-fn readLine(alloc: Allocator, r: anytype, leftover: *[]u8) !?[]u8 {
-    var line = try std.ArrayList(u8).initCapacity(alloc, 0);
-
-    // 1) Consume any bytes buffered from a previous read.
-    if (leftover.*.len > 0) {
-        var nl: ?usize = null;
-        for (leftover.*, 0..) |b, i| {
-            if (b == '\n') {
-                nl = i;
-                break;
-            }
-        }
-        if (nl) |i| {
-            try line.appendSlice(alloc, leftover.*[0..i]);
-            if (leftover.*.len > i + 1) {
-                const dup = try alloc.dupe(u8, leftover.*[i + 1 ..]);
-                alloc.free(leftover.*);
-                leftover.* = dup;
-            } else {
-                alloc.free(leftover.*);
-                leftover.* = &.{};
-            }
-            return try line.toOwnedSlice(alloc);
-        }
-        try line.appendSlice(alloc, leftover.*);
-        alloc.free(leftover.*);
-        leftover.* = &.{};
-    }
-
-    // 2) Read fresh chunks until a newline or end of stream.
-    var chunk: [1024]u8 = undefined;
+fn readLine(alloc: Allocator, r: *std.Io.Reader) !?[]u8 {
+    // Manual line assembly over the raw Reader primitives: 0.16's
+    // `takeDelimiterExclusive` spins on fixed readers (see spec 018 notes), so
+    // this loop consumes buffered chunks, splitting on '\n' explicitly.
+    var out = try std.ArrayList(u8).initCapacity(alloc, 0);
+    errdefer out.deinit(alloc);
     while (true) {
-        const n = r.read(&chunk) catch break;
-        if (n == 0) break;
-        var nl: ?usize = null;
-        for (chunk[0..n], 0..) |b, i| {
-            if (b == '\n') {
-                nl = i;
-                break;
-            }
+        if (r.bufferedLen() == 0) {
+            r.fill(1) catch |e| switch (e) {
+                error.EndOfStream => break,
+                else => return e,
+            };
         }
-        if (nl) |i| {
-            try line.appendSlice(alloc, chunk[0..i]);
-            if (n > i + 1) {
-                if (leftover.*.len > 0) alloc.free(leftover.*);
-                leftover.* = try alloc.dupe(u8, chunk[i + 1 .. n]);
-            }
-            return try line.toOwnedSlice(alloc);
+        if (r.bufferedLen() == 0) break;
+        const chunk = r.buffered();
+        if (std.mem.indexOfScalar(u8, chunk, '\n')) |idx| {
+            try out.appendSlice(alloc, chunk[0..idx]);
+            r.toss(idx + 1);
+            return try out.toOwnedSlice(alloc);
         }
-        try line.appendSlice(alloc, chunk[0..n]);
+        try out.appendSlice(alloc, chunk);
+        r.toss(chunk.len);
     }
-
-    // 3) End of stream: return a final partial line if present.
-    if (line.items.len == 0) {
-        line.deinit(alloc);
+    if (out.items.len == 0) {
+        out.deinit(alloc);
         return null;
     }
-    if (leftover.*.len > 0) alloc.free(leftover.*);
-    leftover.* = &.{};
-    return try line.toOwnedSlice(alloc);
+    return try out.toOwnedSlice(alloc);
 }
 
 /// Run the dispatch loop: read lines from `reader`, parse, dispatch to the
@@ -93,16 +60,14 @@ fn readLine(alloc: Allocator, r: anytype, leftover: *[]u8) !?[]u8 {
 /// or a `Result.exit`.
 pub fn run(
     alloc: Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     output: Output,
     dispatcher: *Dispatcher,
     prompt: ?[]const u8,
 ) !void {
-    var leftover: []u8 = &.{};
-    defer if (leftover.len > 0) alloc.free(leftover);
     while (true) {
         if (prompt) |p| output.write(p);
-        const line = readLine(alloc, reader, &leftover) catch break;
+        const line = readLine(alloc, reader) catch break;
         if (line == null) break;
         defer alloc.free(line.?);
 

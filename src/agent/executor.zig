@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const state = @import("state.zig");
 const provider = @import("../provider/provider.zig");
 const Tool = @import("../tool/tool.zig").Tool;
@@ -67,7 +68,7 @@ pub const GoalExecutor = struct {
     fn logLine(alloc: Allocator, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.allocPrint(alloc, fmt ++ "\n", args) catch return;
         defer alloc.free(s);
-        std.fs.File.stdout().writeAll(s) catch {};
+        std.Io.File.stdout().writeStreamingAll(compat.io(), s) catch {};
     }
 
     /// Owns `goal.progress` as a heap slice: frees the previous value before
@@ -275,7 +276,7 @@ pub const GoalExecutor = struct {
                     stopped = true;
                     break;
                 }
-                std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                compat.sleepMs(poll_ms);
             }
             if (!io.done.load(.acquire)) {
                 // Abort grace: give the in-flight call a short window to finish
@@ -284,7 +285,7 @@ pub const GoalExecutor = struct {
                 // dies with the process. Socket-level cancel is out of scope.
                 var waited: u64 = 0;
                 while (!io.done.load(.acquire) and waited < grace_ms) {
-                    std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                    compat.sleepMs(poll_ms);
                     waited += poll_ms;
                 }
             }
@@ -301,7 +302,7 @@ pub const GoalExecutor = struct {
                     var slept: u64 = 0;
                     while (slept < 200) : (slept += poll_ms) {
                         if (self.stopRequested()) return .aborted;
-                        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                        compat.sleepMs(poll_ms);
                     }
                     continue;
                 }
@@ -318,22 +319,22 @@ pub const GoalExecutor = struct {
 
     fn systemPrompt(self: *GoalExecutor) ![]u8 {
         var sb = try std.ArrayList(u8).initCapacity(self.alloc, 0);
-        try sb.writer(self.alloc).writeAll(
+        try sb.appendSlice(self.alloc,
             \\You are an autonomous coding agent. Use the provided tools to pursue the user's goal.
             \\Call one tool at a time. When the goal is achieved, reply with a final message and no tool calls.
             \\
         );
         for (self.tools) |t| {
             const s = t.schema();
-            try std.fmt.format(sb.writer(self.alloc), "Tool {s}: {s}\n", .{ s.name, s.description });
+            try sb.print(self.alloc, "Tool {s}: {s}\n", .{ s.name, s.description });
         }
         if (self.skills_listing) |listing| {
             if (listing.len > 0) {
-                try sb.writer(self.alloc).writeAll(
+                try sb.appendSlice(self.alloc,
                     \\Skills you can consult — use the skill tool with the exact name to get its full instructions:
                     \\
                 );
-                try sb.writer(self.alloc).writeAll(listing);
+                try sb.appendSlice(self.alloc, listing);
             }
         }
         return sb.toOwnedSlice(self.alloc);
@@ -415,7 +416,7 @@ pub const GoalExecutor = struct {
 
         // Wall-clock budget carry (spec 013 D4) + cached default stop path.
         self.carried_seconds = goal.used.seconds;
-        self.run_start_ms = std.time.milliTimestamp();
+        self.run_start_ms = compat.milliTimestamp();
         if (self.stop_path) |p| self.alloc.free(p);
         self.stop_path = try std.fmt.allocPrint(self.alloc, "{s}/stop.{s}", .{ self.dir, self.session_id });
         defer {
@@ -462,7 +463,7 @@ pub const GoalExecutor = struct {
                 return;
             }
             // Time budget (spec 013 D4): persisted carry + this run's elapsed.
-            const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - self.run_start_ms));
+            const elapsed_ms: u64 = @intCast(@max(0, compat.milliTimestamp() - self.run_start_ms));
             goal.used.seconds = self.carried_seconds + elapsed_ms / 1000;
             if (goal.used.seconds >= goal.budgets.max_seconds) {
                 try self.finish(goal, .aborted, "aborted: time budget exceeded", "aborted: time budget exceeded", "aborted: time budget exceeded");
@@ -597,7 +598,7 @@ pub const GoalExecutor = struct {
 
     /// Append a human-readable reason something was skipped (FR-006).
     fn addSkip(self: *GoalExecutor, msg: []const u8) !void {
-        try std.fmt.format(self.skipped.writer(self.alloc), "{s}\n", .{msg});
+        try self.skipped.print(self.alloc, "{s}\n", .{msg});
     }
 
     /// Snapshot paths already modified/untracked before the run (FR-005 safety).
@@ -622,7 +623,7 @@ pub const GoalExecutor = struct {
         } else {
             var it = self.intentional.keyIterator();
             while (it.next()) |k| {
-                try std.fmt.format(sb.writer(self.alloc), "  {s}\n", .{k.*});
+                try sb.print(self.alloc, "  {s}\n", .{k.*});
             }
         }
 
@@ -633,7 +634,7 @@ pub const GoalExecutor = struct {
             var it = std.mem.splitScalar(u8, self.skipped.items, '\n');
             while (it.next()) |line| {
                 if (line.len == 0) continue;
-                try std.fmt.format(sb.writer(self.alloc), "  {s}\n", .{line});
+                try sb.print(self.alloc, "  {s}\n", .{line});
             }
         }
 
@@ -645,7 +646,7 @@ pub const GoalExecutor = struct {
                 var it = std.mem.splitScalar(u8, reverted, '\n');
                 while (it.next()) |line| {
                     if (line.len == 0) continue;
-                    try std.fmt.format(sb.writer(self.alloc), "  {s}\n", .{line});
+                    try sb.print(self.alloc, "  {s}\n", .{line});
                 }
             }
         }
@@ -669,17 +670,18 @@ pub const GoalExecutor = struct {
 /// Used by the FR-005 tree-cleanup helpers; failures are non-fatal (the cleanup
 /// is best-effort and must never crash the goal loop).
 fn runCapture(alloc: Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return alloc.dupe(u8, "");
+    var child = std.process.spawn(compat.io(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return alloc.dupe(u8, "");
     // ChildProcess has no deinit() in this Zig version, so the pipe fds (and the
-    // std.fs.File buffers wrapping them) leak when `child` leaves scope. Close
-    // them explicitly on every return path.
+    // files wrapping them) leak when `child` leaves scope. Close them explicitly
+    // on every return path.
     defer {
-        if (child.stdout) |s| s.close();
-        if (child.stderr) |e| e.close();
+        if (child.stdout) |s| s.close(compat.io());
+        if (child.stderr) |e| e.close(compat.io());
     }
     const fd = child.stdout.?.handle;
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
@@ -687,17 +689,17 @@ fn runCapture(alloc: Allocator, argv: []const []const u8) ![]u8 {
     while (true) {
         const n = std.posix.read(fd, &tmp) catch {
             out.deinit(alloc);
-            _ = child.wait() catch unreachable;
+            _ = child.wait(compat.io()) catch unreachable;
             return alloc.dupe(u8, "");
         };
         if (n == 0) break;
         out.appendSlice(alloc, tmp[0..n]) catch {
             out.deinit(alloc);
-            _ = child.wait() catch unreachable;
+            _ = child.wait(compat.io()) catch unreachable;
             return alloc.dupe(u8, "");
         };
     }
-    _ = child.wait() catch unreachable;
+    _ = child.wait(compat.io()) catch unreachable;
     return out.toOwnedSlice(alloc);
 }
 
@@ -751,7 +753,7 @@ fn revertIncidental(alloc: Allocator, cwd: []const u8, intentional: *const Inten
             const argv = [_][]const u8{ "git", "-C", cwd, "checkout", "HEAD", "--", sp.path };
             if (runCapture(alloc, &argv)) |cap| alloc.free(cap) else |_| {}
         }
-        try std.fmt.format(reverted.writer(alloc), "{s}\n", .{sp.path});
+        try reverted.print(alloc, "{s}\n", .{sp.path});
     }
     return reverted.toOwnedSlice(alloc);
 }
@@ -941,7 +943,7 @@ test "revertIncidental reverts only drift, not pre-existing or intentional" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     const dir = tmp.dir;
-    const cwd = try dir.realpathAlloc(alloc, ".");
+    const cwd = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(cwd);
     defer tmp.cleanup();
 
@@ -949,15 +951,15 @@ test "revertIncidental reverts only drift, not pre-existing or intentional" {
     try runGit(alloc, cwd, &.{ "init", "-q" });
     try runGit(alloc, cwd, &.{ "config", "user.email", "test@example.com" });
     try runGit(alloc, cwd, &.{ "config", "user.name", "test" });
-    try dir.writeFile(.{ .sub_path = "tracked.txt", .data = "original" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "tracked.txt", .data = "original" });
     try runGit(alloc, cwd, &.{ "add", "tracked.txt" });
     try runGit(alloc, cwd, &.{ "commit", "-q", "-m", "init" });
 
     // a pre-existing untracked file the user already had (must survive cleanup)
-    try dir.writeFile(.{ .sub_path = "preexisting.txt", .data = "mine" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "preexisting.txt", .data = "mine" });
     // drift introduced during the run: a modified tracked file + a stray untracked file
-    try dir.writeFile(.{ .sub_path = "tracked.txt", .data = "DRIFT" });
-    try dir.writeFile(.{ .sub_path = "stray.txt", .data = "oops" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "tracked.txt", .data = "DRIFT" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "stray.txt", .data = "oops" });
 
     var pre = IntentionalMap.init(alloc);
     defer {
@@ -984,12 +986,12 @@ test "revertIncidental reverts only drift, not pre-existing or intentional" {
     try std.testing.expect(std.mem.indexOf(u8, reverted, "preexisting.txt") == null);
 
     // On disk: tracked reverted to original, stray gone, preexisting kept.
-    const t = try dir.readFileAlloc(alloc, "tracked.txt", 64);
+    const t = try dir.readFileAlloc(compat.io(), "tracked.txt", alloc, .limited(64));
     defer alloc.free(t);
     try std.testing.expectEqualStrings("original", t);
     // stray.txt was incidental untracked drift and must be removed by cleanup.
-    try std.testing.expect(dir.access("stray.txt", .{}) == error.FileNotFound);
-    const p = try dir.readFileAlloc(alloc, "preexisting.txt", 64);
+    try std.testing.expect(dir.access(compat.io(), "stray.txt", .{}) == error.FileNotFound);
+    const p = try dir.readFileAlloc(compat.io(), "preexisting.txt", alloc, .limited(64));
     defer alloc.free(p);
     try std.testing.expectEqualStrings("mine", p);
 }
@@ -1412,7 +1414,7 @@ test "provider response arriving after the signal is discarded (B13)" {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             self.probe.raise();
-            std.Thread.sleep(150 * std.time.ns_per_ms);
+            compat.sleepMs(150);
             const tcs = [_]provider.ToolCall{.{ .id = "c9", .name = "write_file", .arguments_json = "{\"path\":\"late.txt\",\"data\":\"x\"}" }};
             return provider.ChatResponse{
                 .message = .{ .role = .assistant, .content = "", .tool_calls = try pa.dupe(provider.ToolCall, &tcs) },

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const state = @import("state.zig");
 const Transport = @import("../provider/transport.zig").Transport;
 const Header = @import("../provider/transport.zig").Header;
@@ -58,7 +59,8 @@ fn serialize(alloc: Allocator, p: state.PaneReportParams) ![]u8 {
     else
         "";
     defer if (p.message) |_| alloc.free(msg_part);
-    return std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(
+        alloc,
         "{{\"pane_id\":{f},\"source\":{f},\"agent\":{f},\"state\":{f}{s},\"seq\":{d},\"agent_session_id\":{f},\"agent_session_path\":{f}}}",
         .{
             std.json.fmt(p.pane_id, .{}),
@@ -81,7 +83,9 @@ pub fn defaultApiUrl() []const u8 {
 /// Resolve the Herdr API base URL: `HERDR_API_URL` if set, else the default.
 /// The returned slice is owned by `alloc` and must be freed by the caller.
 pub fn resolveApiUrl(alloc: Allocator) ![]const u8 {
-    return resolveApiUrlFrom(alloc, std.process.getEnvVarOwned(alloc, "HERDR_API_URL") catch null);
+    const existing = compat.getEnvOwned(alloc, "HERDR_API_URL") catch null;
+    if (existing) |e| return e;
+    return try alloc.dupe(u8, defaultApiUrl());
 }
 
 /// Pure variant: `env` non-null wins, otherwise the default. Split out so the
@@ -196,9 +200,9 @@ test "resolveApiUrl resolves env when set and default when unset (U12)" {
 
     // The real entry point: when HERDR_API_URL is unset in this process it must
     // resolve to the default. (Skipped if the env var is already set.)
-    if (std.process.getEnvVarOwned(alloc, "HERDR_API_URL")) |existing| {
+    if (try compat.getEnvOwned(alloc, "HERDR_API_URL")) |existing| {
         alloc.free(existing);
-    } else |_| {
+    } else {
         const from_env = try resolveApiUrl(alloc);
         defer alloc.free(from_env);
         try std.testing.expectEqualStrings("http://localhost:7878", from_env);
