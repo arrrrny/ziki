@@ -107,8 +107,12 @@ pub const GoalExecutor = struct {
                 return true;
             },
             error.ModelNotFound => {
-                const hint = self.provider.errorHint() orelse "check the model id against the gateway's model list";
-                const msg = try std.fmt.allocPrint(self.alloc, "model rejected by gateway — available models: {s}", .{hint});
+                // Both branches allocate so one cleanup path covers the hinted
+                // and hintless messages.
+                const msg: []u8 = if (self.provider.errorHint()) |h|
+                    try std.fmt.allocPrint(self.alloc, "model rejected by gateway — available models: {s}", .{h})
+                else
+                    try self.alloc.dupe(u8, "model rejected by gateway — check the model id against the gateway's model list");
                 defer self.alloc.free(msg);
                 try self.finish(goal, .blocked, msg, msg, "model rejected by gateway");
                 return true;
@@ -592,7 +596,13 @@ pub const GoalExecutor = struct {
             }
 
             if (goal.criterion) |crit| {
-                const satisfied = (try self.verify(a, &messages, crit)) orelse {
+                // Spec 014 US3/US4: a credential/model rejection during
+                // criterion verification blocks the goal exactly like the main
+                // turn loop does — never escapes as a bare error.
+                const satisfied = (self.verify(a, &messages, crit) catch |e| {
+                    if (try self.finishProviderBlocked(goal, e)) return;
+                    return e;
+                }) orelse {
                     // Stop observed during verification I/O: same graceful
                     // abort as the main path.
                     if (self.stop_path) |p| self.fs.remove(p) catch {};
