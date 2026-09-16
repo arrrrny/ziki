@@ -521,9 +521,15 @@ pub const GoalExecutor = struct {
                     }
                     const res = try self.dispatch(a, tc);
                     if (self.verbose) logLine(self.alloc, "verbose: tool_result[{s}]: {s}", .{ tc.name, res.output });
+                    // Spec 015 (issue #18): a failed tool call reaches the model
+                    // as `error: ...` text so it can react, never as empty content.
+                    const tool_content = if (res.ok)
+                        res.output
+                    else
+                        try std.fmt.allocPrint(a, "error: {s}", .{res.error_message orelse "tool failed"});
                     try messages.append(a, .{
                         .role = .tool,
-                        .content = try a.dupe(u8, res.output),
+                        .content = try a.dupe(u8, tool_content),
                         .tool_call_id = try a.dupe(u8, tc.id),
                     });
                     // Persist after every tool result: a crash mid-loop must
@@ -1673,6 +1679,90 @@ test "resume round-trip through the store continues an interrupted goal (B18)" {
         // Transcript cleared at terminal so the next goal starts clean.
         try std.testing.expect((try repo2.loadHistory(alloc, reloaded.id)) == null);
     }
+}
+
+/// Recording provider for the error-propagation test: inspects every request
+/// while it is alive (the messages live in the executor's run arena, which is
+/// freed when `run` returns — so nothing may be retained past the call).
+const CapturingProvider = struct {
+    responses: []const provider.ChatResponse,
+    idx: usize = 0,
+    saw_tool_error: bool = false,
+
+    fn init(responses: []const provider.ChatResponse) CapturingProvider {
+        return .{ .responses = responses };
+    }
+    fn toProvider(self: *CapturingProvider) provider.Provider {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+
+    fn name(_: *anyopaque) []const u8 {
+        return "capturing";
+    }
+    fn complete(ctx: *anyopaque, alloc: Allocator, req: provider.CompletionRequest) !provider.ChatResponse {
+        const self: *CapturingProvider = @ptrCast(@alignCast(ctx));
+        for (req.messages) |m| {
+            if (m.role == .tool and std.mem.indexOf(u8, m.content, "error: unknown tool: no_such_tool") != null) {
+                self.saw_tool_error = true;
+            }
+        }
+        const r = self.responses[self.idx];
+        if (self.idx + 1 < self.responses.len) self.idx += 1;
+        var tcs: ?[]provider.ToolCall = null;
+        if (r.message.tool_calls) |src| {
+            const owned = try alloc.alloc(provider.ToolCall, src.len);
+            for (src, 0..) |tc, i| {
+                owned[i] = .{
+                    .id = try alloc.dupe(u8, tc.id),
+                    .name = try alloc.dupe(u8, tc.name),
+                    .arguments_json = try alloc.dupe(u8, tc.arguments_json),
+                };
+            }
+            tcs = owned;
+        }
+        return provider.ChatResponse{
+            .message = .{ .role = r.message.role, .content = try alloc.dupe(u8, r.message.content), .tool_calls = tcs },
+            .finish_reason = r.finish_reason,
+        };
+    }
+};
+
+// Issue #18 (Lane C): failed tool calls must reach the model as error text.
+test "executor propagates a failed tool's error_message into the conversation (A3)" {
+    const alloc = std.testing.allocator;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    var fake = @import("../fs/fs.zig").FakeFs.init(alloc, "/wd");
+    defer fake.deinit();
+
+    const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "no_such_tool", .arguments_json = "{}" }};
+    const responses = [_]provider.ChatResponse{
+        .{ .message = .{ .role = .assistant, .content = "", .tool_calls = &tcs }, .finish_reason = .tool_calls },
+        .{ .message = .{ .role = .assistant, .content = "I'll adapt." } },
+    };
+    var cp = CapturingProvider.init(&responses);
+    const fp = cp.toProvider();
+
+    const tools = [_]Tool{};
+    var repo_impl = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const repo = repo_impl.toRepository();
+    var ex = GoalExecutor{
+        .alloc = alloc,
+        .provider = fp,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    var goal = try @import("../goal/goal.zig").Goal.init(alloc, "use tools", null, "sess1");
+    defer goal.deinit(alloc);
+    try ex.run(&goal);
+    defer if (ex.report) |r| alloc.free(r);
+
+    try std.testing.expect(goal.status == .completed);
+    // A later request carried the failed tool call's error text.
+    try std.testing.expect(cp.saw_tool_error);
 }
 
 // ---------------------------------------------------------------------------
