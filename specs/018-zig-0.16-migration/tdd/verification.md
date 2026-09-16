@@ -11,11 +11,14 @@
   (`comptime` os gate) and keep running on the Linux CI gate.
 
 ## Gaps (non-blocking, tracked)
-1. **0.16.0 + macOS loopback limitation** — `std.http.Client` never writes its
-   request (probe-verified: connect ok, flush "ok", kernel queues empty), and a
-   listener-thread + client on one Threaded Io panics with EAGAIN. Three tests
-   skip on macOS only: proxy routing, Unix-socket round-trip (A4), TLS non-200
-   CONNECT. Linux CI exercises them; re-verify locally after a Zig release bump.
+1. **0.16.0 loopback limitation (all platforms)** — with a listener and a client
+   on one Threaded Io, `std.http.Client` never writes its request (probe-verified:
+   connect ok, flush "ok", kernel queues empty) and the raw-socket path panics
+   with EAGAIN. First seen on macOS; the Linux CI gate then hung on the same
+   tests (20-minute job timeout), so the three loopback tests (proxy routing,
+   Unix-socket round-trip A4, TLS non-200 CONNECT) now skip under 0.16.0 on every
+   platform via a documented runtime guard. The 0.15.2 suite still runs them end
+   to end; re-enable after a Zig release bump that fixes Threaded-Io loopback.
 2. `readLine` in repl.zig reimplements line assembly over raw Reader primitives
    (`takeDelimiterExclusive` spins on fixed readers in 0.16.0).
 3. Dual-toolchain (0.15+0.16) compatibility was explicitly NOT attempted — the
