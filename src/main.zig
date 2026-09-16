@@ -102,12 +102,17 @@ var g_goal_stop_path: [512]u8 = undefined;
 var g_goal_stop_len: usize = 0;
 var g_goal_active = std.atomic.Value(bool).init(false);
 
-fn goalSignalHandler(sig: i32) callconv(.c) void {
+fn goalSignalHandler(sig: std.c.SIG) callconv(.c) void {
     _ = sig;
-    if (!g_goal_active.load(.acquire)) std.posix.exit(130); // no run active: default die
-    if (g_goal_stop_len == 0) return;
-    const fd = std.posix.open(g_goal_stop_path[0..g_goal_stop_len], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return;
-    std.posix.close(fd);
+    // 0.16: the Sigaction handler takes the system SIG enum; exit lives on
+    // std.process now.
+    if (!g_goal_active.load(.acquire)) std.process.exit(130); // no run active: default die
+    if (g_goal_stop_len == 0 or g_goal_stop_len >= g_goal_stop_path.len) return;
+    // Async-signal-safe: plain C open/close (std.posix.open is gone in 0.16).
+    g_goal_stop_path[g_goal_stop_len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&g_goal_stop_path);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd >= 0) _ = std.c.close(fd);
 }
 
 fn armGoalSignals(stop_path: []const u8) void {
@@ -634,7 +639,7 @@ fn runResume(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sess
     goal.status = .active;
     alloc.free(goal.progress);
     goal.progress = try alloc.dupe(u8, "resumed");
-    goal.updated_at = std.time.timestamp();
+    goal.updated_at = @intCast(std.Io.Clock.real.now(compat.io()).toSeconds());
 
     try emit("resuming goal {s}: {s}", .{ goal.id, goal.objective });
     try emit("  turns: {d}/{d}  tokens: {d}  elapsed: {d}s", .{ goal.used.turns, goal.budgets.max_turns, goal.used.tokens, goal.used.seconds });
@@ -826,14 +831,20 @@ fn usage() !void {
 }
 
 pub fn main(env: std.process.Init) !void {
-    // 0.16: start.zig hands us the process environment (Io + environ map).
+    // 0.16: start.zig hands us the process environment (Io + environ map) and
+    // a leak-checked gpa; there is no GeneralPurposeAllocator to build here.
     compat.init(env);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-    defer _ = gpa.deinit();
+    const alloc = env.gpa;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    var arg_list = try std.ArrayList([]const u8).initCapacity(alloc, 0);
+    defer {
+        for (arg_list.items) |a| alloc.free(a);
+        arg_list.deinit(alloc);
+    }
+    var arg_it = std.process.Args.Iterator.initAllocator(env.minimal.args, alloc) catch std.process.Args.Iterator.init(env.minimal.args);
+    defer arg_it.deinit();
+    while (arg_it.next()) |a| try arg_list.append(alloc, try alloc.dupe(u8, a));
+    const args: []const []const u8 = arg_list.items;
 
     const cwd = try std.process.currentPathAlloc(compat.io(), alloc);
     defer alloc.free(cwd);
