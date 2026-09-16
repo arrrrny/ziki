@@ -13,6 +13,7 @@ const fake = @import("src/provider/fake.zig");
 const presets = @import("src/provider/presets.zig");
 const presets_test = @import("src/provider/presets_test.zig");
 const tool = @import("src/tool/tool.zig");
+const confine = @import("src/tool/confine.zig");
 const read = @import("src/tool/read.zig");
 const edit = @import("src/tool/edit.zig");
 const search = @import("src/tool/search.zig");
@@ -46,6 +47,7 @@ test "aggregator loads all modules" {
     _ = presets;
     _ = presets_test;
     _ = tool;
+    _ = confine;
     _ = read;
     _ = edit;
     _ = search;
