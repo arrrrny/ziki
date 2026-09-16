@@ -45,7 +45,6 @@ fn readLine(alloc: Allocator, r: *std.Io.Reader) !?[]u8 {
         }
         try out.appendSlice(alloc, chunk);
         r.toss(chunk.len);
-        if (r.bufferedLen() == 0 and r.seek == r.end) break;
     }
     if (out.items.len == 0) {
         out.deinit(alloc);

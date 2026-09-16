@@ -118,7 +118,7 @@ pub fn post(alloc: Allocator, socket_path: []const u8, method: []const u8, reque
     const ri = &sr.interface;
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = ri.readSliceShort(&buf) catch break;
+        const n = ri.readSliceShort(&buf) catch |e| return e;
         if (n == 0) break;
         if (raw.items.len + n > max_response_bytes) return error.ResponseTooLarge;
         try raw.appendSlice(alloc, buf[0..n]);

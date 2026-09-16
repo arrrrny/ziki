@@ -96,6 +96,12 @@ pub fn envMap() !*const std.process.Environ.Map {
 /// `dir` handle — but its fixed layout is `cwd()/.zig-cache/tmp/<sub_path>`
 /// (see `std.testing.tmpDir`), so the absolute path can be reconstructed
 /// without any realpath syscall. Caller owns the returned slice.
+///
+/// Stopgap: this couples the suite to `std.testing`'s private tmp layout and
+/// to the local cache dir living at `<cwd>/.zig-cache` — a std layout change,
+/// a custom `--cache-dir`/`ZIG_LOCAL_CACHE_DIR`, or running tests outside the
+/// repo root yields a wrong path. Tracked follow-up: obtain the real tmp
+/// absolute path from `std.testing` if 0.16.x ever exposes one.
 pub fn tmpDirPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const cwd = try std.process.currentPathAlloc(io(), alloc);
     defer alloc.free(cwd);
