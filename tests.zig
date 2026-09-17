@@ -12,6 +12,7 @@ const transport_tls = @import("src/provider/transport_tls.zig");
 const openai = @import("src/provider/openai.zig");
 const fake = @import("src/provider/fake.zig");
 const presets = @import("src/provider/presets.zig");
+const presets_test = @import("src/provider/presets_test.zig");
 const tool = @import("src/tool/tool.zig");
 const confine = @import("src/tool/confine.zig");
 const read = @import("src/tool/read.zig");
@@ -46,6 +47,7 @@ test "aggregator loads all modules" {
     _ = openai;
     _ = fake;
     _ = presets;
+    _ = presets_test;
     _ = tool;
     _ = confine;
     _ = read;

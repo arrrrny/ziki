@@ -366,6 +366,7 @@ fn runGoal(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sessio
         return;
     };
     const prov = prov_impl.toProvider();
+    defer prov_impl.deinit(alloc); // models_hint captured by the error-path probe
 
     var rt = ReadTool.init(fs_iface);
     const read_t = rt.toTool();
@@ -585,6 +586,7 @@ fn runResume(alloc: Allocator, tokens: [][]const u8, state_dir: []const u8, sess
         return;
     };
     const prov = prov_impl.toProvider();
+    defer prov_impl.deinit(alloc); // models_hint captured by the error-path probe
 
     var rt = ReadTool.init(fs_iface);
     const read_t = rt.toTool();

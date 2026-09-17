@@ -34,8 +34,9 @@ pub fn findPreset(name: []const u8) ?Preset {
 ///
 /// Returns the provider struct **by value**: the caller must keep the result in
 /// a `var` and derive the `Provider` interface from it, otherwise the vtable's
-/// `ctx` would point at a dangling stack slot (the provider holds no heap state
-/// beyond the slices the caller already owns).
+/// `ctx` would point at a dangling stack slot. The provider owns one heap
+/// slice — `models_hint`, captured by the error-path probe (spec 014 US4) —
+/// so free it with `OpenAIProvider.deinit` when the run ends.
 pub fn build(
     alloc: Allocator,
     name: []const u8,

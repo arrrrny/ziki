@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const provider = @import("provider.zig");
 const Transport = @import("transport.zig").Transport;
 const Header = @import("transport.zig").Header;
+const HttpResponse = @import("transport.zig").HttpResponse;
 
 /// OpenAI-compatible Chat Completions client. This is the single reference
 /// provider (spec 004); the five required providers are config presets over it
@@ -14,6 +15,9 @@ pub const OpenAIProvider = struct {
     api_key: []const u8,
     transport: Transport,
     alloc: Allocator,
+    /// Comma-joined model ids from the gateway's models list, captured when a
+    /// model-id rejection triggered the error-path probe (spec 014 US4).
+    models_hint: ?[]u8 = null,
 
     pub fn init(alloc: Allocator, provider_name: []const u8, endpoint: []const u8, model: []const u8, api_key: []const u8, transport: Transport) OpenAIProvider {
         return .{
@@ -25,10 +29,73 @@ pub const OpenAIProvider = struct {
             .alloc = alloc,
         };
     }
+    /// Frees the provider-owned `models_hint` slice captured by the error-path
+    /// probe (spec 014 US4). Call once when the provider is torn down.
+    pub fn deinit(self: *OpenAIProvider, alloc: Allocator) void {
+        if (self.models_hint) |h| alloc.free(h);
+        self.models_hint = null;
+    }
     pub fn toProvider(self: *OpenAIProvider) provider.Provider {
         return .{ .ctx = self, .vtable = &vtable };
     }
-    const vtable = provider.Provider.VTable{ .complete = complete, .name = name };
+    const vtable = provider.Provider.VTable{ .complete = complete, .name = name, .error_hint = errorHint };
+
+    fn errorHint(ctx: *anyopaque) ?[]const u8 {
+        const self: *OpenAIProvider = @ptrCast(@alignCast(ctx));
+        return self.models_hint;
+    }
+
+    /// Best-effort models-list probe for the error path (spec 014 US4):
+    /// GET {endpoint}/models, join up to 8 ids. Any failure leaves the hint
+    /// unset — the caller's message must be actionable without it.
+    fn probeModels(self: *OpenAIProvider) void {
+        const alloc = self.alloc;
+        const url = std.fmt.allocPrint(alloc, "{s}/models", .{self.endpoint}) catch return;
+        defer alloc.free(url);
+        var headers: [1]Header = undefined;
+        var n: usize = 0;
+        var auth: []const u8 = "";
+        if (self.api_key.len > 0) {
+            auth = std.fmt.allocPrint(alloc, "Bearer {s}", .{self.api_key}) catch return;
+        }
+        // The defer must live at function scope: inside the `if` above it would
+        // free the string before `request` runs below.
+        defer if (auth.len > 0) alloc.free(auth);
+        if (auth.len > 0) {
+            headers[n] = .{ .name = "authorization", .value = auth };
+            n += 1;
+        }
+        const resp = self.transport.request(alloc, "GET", url, headers[0..n], "") catch return;
+        defer alloc.free(resp.body);
+        // Only a 2xx body carries a models list — never parse an error body.
+        if (resp.status < 200 or resp.status >= 300) return;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const data = parsed.value.object.get("data") orelse return;
+        if (data != .array) return;
+        var buf = std.ArrayList(u8){};
+        var count: usize = 0;
+        for (data.array.items) |item| {
+            if (item != .object) continue;
+            const idv = item.object.get("id") orelse continue;
+            if (idv != .string) continue;
+            if (count > 0) buf.appendSlice(alloc, ", ") catch break;
+            buf.appendSlice(alloc, idv.string) catch break;
+            count += 1;
+            if (count >= 8) break;
+        }
+        if (count == 0) {
+            buf.deinit(alloc);
+            return;
+        }
+        if (self.models_hint) |old| alloc.free(old);
+        if (buf.toOwnedSlice(alloc)) |owned| {
+            self.models_hint = owned;
+        } else |_| {
+            buf.deinit(alloc);
+        }
+    }
 
     fn name(ctx: *anyopaque) []const u8 {
         const self: *OpenAIProvider = @ptrCast(@alignCast(ctx));
@@ -62,7 +129,17 @@ pub const OpenAIProvider = struct {
         defer alloc.free(resp.body);
 
         if (resp.status < 200 or resp.status >= 300) {
-            return error.ProviderError;
+            // Spec 014 US3/US4: distinct, non-transient error kinds. Message
+            // strings never embed key material or response bodies.
+            switch (resp.status) {
+                401 => return error.Unauthorized,
+                403 => return error.Forbidden,
+                400, 404 => {
+                    self.probeModels();
+                    return error.ModelNotFound;
+                },
+                else => return error.ProviderError,
+            }
         }
 
         return try parseResponse(alloc, resp.body);
@@ -265,4 +342,91 @@ test "buildRequestBody embeds raw schema" {
     try std.testing.expectEqualStrings("assistant", parsed.value.messages[1].role);
     // tool_calls must be present and nested inside the assistant message object.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_calls\":[{\"id\":\"c1\"") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: credential + model-id error paths (spec 014 US3/US4).
+// ---------------------------------------------------------------------------
+
+const CapResp = struct { status: u16, body: []const u8 };
+
+const CapTransport = struct {
+    alloc: Allocator,
+    script: []const CapResp,
+    idx: usize = 0,
+    methods: std.ArrayList([]u8),
+    urls: std.ArrayList([]u8),
+    auths: std.ArrayList([]u8),
+
+    fn init(alloc: Allocator, script: []const CapResp) CapTransport {
+        return .{ .alloc = alloc, .script = script, .methods = .{}, .urls = .{}, .auths = .{} };
+    }
+    fn toTransport(self: *CapTransport) Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = Transport.VTable{ .request = request };
+
+    fn request(ctx: *anyopaque, alloc: Allocator, method: []const u8, url: []const u8, headers: []const Header, body: []const u8) anyerror!HttpResponse {
+        _ = body;
+        const self: *CapTransport = @ptrCast(@alignCast(ctx));
+        try self.methods.append(self.alloc, try alloc.dupe(u8, method));
+        try self.urls.append(self.alloc, try alloc.dupe(u8, url));
+        var auth: []const u8 = "";
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) auth = h.value;
+        }
+        try self.auths.append(self.alloc, try alloc.dupe(u8, auth));
+        const s = self.script[@min(self.idx, self.script.len - 1)];
+        self.idx += 1;
+        return .{ .status = s.status, .body = try alloc.dupe(u8, s.body) };
+    }
+    fn lastUrl(self: *CapTransport) []const u8 {
+        return self.urls.items[self.urls.items.len - 1];
+    }
+    fn deinit(self: *CapTransport) void {
+        for (self.methods.items) |m| self.alloc.free(m);
+        self.methods.deinit(self.alloc);
+        for (self.urls.items) |u| self.alloc.free(u);
+        self.urls.deinit(self.alloc);
+        for (self.auths.items) |a| self.alloc.free(a);
+        self.auths.deinit(self.alloc);
+    }
+};
+
+test "complete maps 401/403 to credential errors (A3)" {
+    const alloc = std.testing.allocator;
+    for ([_]CapResp{ .{ .status = 401, .body = "{\"error\":{\"message\":\"bad key\"}}" }, .{ .status = 403, .body = "{\"error\":{\"message\":\"quota\"}}" } }) |script| {
+        var ct = CapTransport.init(alloc, &.{script});
+        defer ct.deinit();
+        var p = OpenAIProvider.init(alloc, "kilo", "https://gw.test/api", "m-1", "sk-secret-do-not-leak", ct.toTransport());
+        const pr = p.toProvider();
+        const req: provider.CompletionRequest = .{ .messages = &.{.{ .role = .user, .content = "hi" }}, .tools = &.{} };
+        const want: anyerror = if (script.status == 401) error.Unauthorized else error.Forbidden;
+        try std.testing.expectError(want, pr.complete(alloc, req));
+        // Exactly one wire attempt (no provider-side retry burn).
+        try std.testing.expectEqual(@as(usize, 1), ct.urls.items.len);
+    }
+}
+
+test "complete maps 404 to ModelNotFound and probes the models list (A4)" {
+    const alloc = std.testing.allocator;
+    const script = [_]CapResp{
+        .{ .status = 404, .body = "{\"error\":{\"message\":\"model nex-agi/nope not found\"}}" },
+        .{ .status = 200, .body = "{\"data\":[{\"id\":\"m-a\"},{\"id\":\"m-b\"}]}" },
+    };
+    var ct = CapTransport.init(alloc, &script);
+    defer ct.deinit();
+    var p = OpenAIProvider.init(alloc, "kilo", "https://gw.test/api", "nex-agi/nope", "k", ct.toTransport());
+    defer p.deinit(alloc); // provider-owned models_hint captured by the probe
+    const pr = p.toProvider();
+    const req: provider.CompletionRequest = .{ .messages = &.{.{ .role = .user, .content = "hi" }}, .tools = &.{} };
+    try std.testing.expectError(error.ModelNotFound, pr.complete(alloc, req));
+    // The error path probed GET {endpoint}/models.
+    try std.testing.expectEqualStrings("GET", ct.methods.items[1]);
+    try std.testing.expectEqualStrings("https://gw.test/api/models", ct.lastUrl());
+    // Both wire calls carry `Bearer <key>` — the probe once sent the raw key.
+    try std.testing.expectEqualStrings("Bearer k", ct.auths.items[0]);
+    try std.testing.expectEqualStrings("Bearer k", ct.auths.items[1]);
+    // The hint is reachable on the error path and lists the gateway's ids.
+    try std.testing.expectEqualStrings("m-a, m-b", pr.errorHint().?);
 }
