@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const presets = @import("../provider/presets.zig");
 
 /// Resolved provider configuration (FR-005). Loaded from environment then
@@ -30,18 +31,17 @@ pub const Config = struct {
 /// Load configuration prioritizing environment variables, then config file
 /// `~/.config/ziki/config.json`. Returns an error if no valid provider is set.
 pub fn load(alloc: Allocator) !Config {
-    var env = std.process.getEnvMap(alloc) catch return error.ConfigError;
-    defer env.deinit();
+    const env = compat.envMap() catch return error.ConfigError;
     // A missing HOME just means "no config file" — loadFile tolerates an empty
     // home (the fixture path won't exist), same as the old behavior.
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch "";
+    const home = (compat.getEnvOwned(alloc, "HOME") catch null) orelse "";
     defer if (home.len > 0) alloc.free(home);
-    return loadFrom(alloc, home, &env);
+    return loadFrom(alloc, home, env);
 }
 
 /// Testable core of `load`: env vars win over `<home>/.config/ziki/config.json`,
 /// with the environment passed explicitly so tests never mutate the process env.
-pub fn loadFrom(alloc: Allocator, home: []const u8, env: *const std.process.EnvMap) !Config {
+pub fn loadFrom(alloc: Allocator, home: []const u8, env: *const std.process.Environ.Map) !Config {
     var provider: []const u8 = "";
     var endpoint: []const u8 = "";
     var model: []const u8 = "";
@@ -94,7 +94,7 @@ const FileOverrides = struct {
 fn loadFile(alloc: Allocator, home: []const u8) !FileOverrides {
     const path = try std.fmt.allocPrint(alloc, "{s}/.config/ziki/config.json", .{home});
     defer alloc.free(path);
-    const raw = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch return error.FileNotFound;
+    const raw = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, alloc, .limited(1 << 20)) catch return error.FileNotFound;
     defer alloc.free(raw);
 
     const Cfg = struct {
@@ -123,12 +123,12 @@ fn resolve(over: []const u8, under: []const u8) []const u8 {
 
 test "load rejects unknown provider" {
     const alloc = std.testing.allocator;
-    var env = std.process.EnvMap.init(alloc);
+    var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
     try env.put("ZIKI_PROVIDER", "anthropic");
     try std.testing.expectError(error.UnknownProvider, loadFrom(alloc, "", &env));
 
-    var empty = std.process.EnvMap.init(alloc);
+    var empty = std.process.Environ.Map.init(alloc);
     defer empty.deinit();
     try std.testing.expectError(error.NoProviderConfigured, loadFrom(alloc, "", &empty));
 }
@@ -145,10 +145,10 @@ test "load exposes proxy from config/env without mutating env" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    const home = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(home);
 
-    var env = std.process.EnvMap.init(alloc);
+    var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
     try env.put("ZIKI_PROVIDER", "kimi");
     try env.put("ZIKI_PROXY", "http://proxy.example.com:8080");
@@ -165,15 +165,15 @@ test "load falls back to the config file proxy when the env leaves it unset" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".config/ziki");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(compat.io(), ".config/ziki");
+    try tmp.dir.writeFile(compat.io(), .{
         .sub_path = ".config/ziki/config.json",
         .data = "{\"active_provider\": \"kimi\", \"endpoint\": \"\", \"model\": \"\", \"api_key\": \"\", \"proxy\": \"http://file-proxy.example.com:3128\"}",
     });
-    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    const home = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(home);
 
-    var env = std.process.EnvMap.init(alloc);
+    var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
     try env.put("ZIKI_PROVIDER", "kimi");
 
@@ -186,15 +186,15 @@ test "config proxy is empty (direct connection) when env and file leave it unset
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".config/ziki");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(compat.io(), ".config/ziki");
+    try tmp.dir.writeFile(compat.io(), .{
         .sub_path = ".config/ziki/config.json",
         .data = "{\"active_provider\": \"kimi\", \"endpoint\": \"\", \"model\": \"\", \"api_key\": \"\"}",
     });
-    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    const home = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(home);
 
-    var env = std.process.EnvMap.init(alloc);
+    var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
     try env.put("ZIKI_PROVIDER", "kimi");
 
@@ -202,4 +202,3 @@ test "config proxy is empty (direct connection) when env and file leave it unset
     defer cfg.deinit(alloc);
     try std.testing.expectEqualStrings("", cfg.proxy);
 }
-

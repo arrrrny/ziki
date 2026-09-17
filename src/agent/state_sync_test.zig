@@ -57,20 +57,26 @@ test "U14 executor publishes working at run start (screen marker before idle)" {
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-1", "goal-u14", "/wd");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-1", "goal-u14", "/wd");
 
     var goal = try runNoCriterion(alloc, &ex);
     defer goal.deinit(alloc);
     defer if (ex.report) |r| alloc.free(r);
 
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     const working_at = std.mem.indexOf(u8, written, "[ziki-state: working]") orelse @panic("no working marker");
     const idle_at = std.mem.indexOf(u8, written, "[ziki-state: idle]") orelse @panic("no idle marker");
     try std.testing.expect(working_at < idle_at);
@@ -86,14 +92,20 @@ test "U15 executor publishes terminal idle on completion" {
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-1", "goal-u15", "/wd");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-1", "goal-u15", "/wd");
 
     var goal = try runNoCriterion(alloc, &ex);
     defer goal.deinit(alloc);
@@ -114,14 +126,20 @@ test "U16 executor publishes terminal idle on abort (turn budget exceeded)" {
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-1", "goal-u16", "/wd");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-1", "goal-u16", "/wd");
 
     // Zero-turn budget forces an abort on the first loop iteration.
     var goal = try Goal.init(alloc, "do something", null, "sess1");
@@ -134,7 +152,7 @@ test "U16 executor publishes terminal idle on abort (turn budget exceeded)" {
     const last = hrep.last orelse @panic("no report");
     try std.testing.expectEqualStrings("idle", last.state);
     // Working was announced at start, then idle on abort — no stale working.
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: idle]") != null);
 }
@@ -148,14 +166,20 @@ test "U17 executor publishes blocked with a message" {
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-1", "goal-u17", "/wd");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-1", "goal-u17", "/wd");
 
     // Criterion never satisfied: three "NO" verifications -> blocked.
     const responses = [_]provider.ChatResponse{
@@ -174,7 +198,7 @@ test "U17 executor publishes blocked with a message" {
     const last = hrep.last orelse @panic("no report");
     try std.testing.expectEqualStrings("blocked", last.state);
     try std.testing.expect(last.message != null);
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: blocked]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
 }
@@ -189,8 +213,13 @@ test "U18 executor with null publisher runs unchanged (no publish attempted)" {
 
     // No `publisher` field set -> must behave exactly as the pre-011 executor.
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var goal = try runNoCriterion(alloc, &ex);
     defer goal.deinit(alloc);
@@ -208,14 +237,20 @@ test "A1 mid-goal push carries full PaneReportParams + working marker/OSC (FR-00
     const tools = [_]Tool{wt_impl.toTool()};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-a1", "goal-a1", "/wd/.ziki");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-a1", "goal-a1", "/wd/.ziki");
 
     // Write a file, then finish -> working(start) then idle(end).
     const tcs = [_]provider.ToolCall{.{ .id = "c1", .name = "write_file", .arguments_json = "{\"path\":\"hello.txt\",\"data\":\"hi\"}" }};
@@ -239,7 +274,7 @@ test "A1 mid-goal push carries full PaneReportParams + working marker/OSC (FR-00
     try std.testing.expectEqualStrings("ziki", last.agent);
     try std.testing.expectEqualStrings("goal-a1", last.agent_session_id);
     try std.testing.expectEqualStrings("/wd/.ziki", last.agent_session_path);
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ziki:working") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: idle]") != null);
@@ -254,14 +289,20 @@ test "A2 blocked push carries message + blocked marker/OSC (FR-006)" {
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-a2", "goal-a2", "/wd/.ziki");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-a2", "goal-a2", "/wd/.ziki");
 
     const responses = [_]provider.ChatResponse{
         .{ .message = .{ .role = .assistant, .content = "NO" } },
@@ -280,7 +321,7 @@ test "A2 blocked push carries message + blocked marker/OSC (FR-006)" {
     try std.testing.expect(last.message != null);
     try std.testing.expectEqualStrings("herdr:ziki", last.source);
     try std.testing.expectEqualStrings("ziki", last.agent);
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: blocked]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ziki:blocked") != null);
 }
@@ -294,14 +335,20 @@ test "A3 terminal idle push leaves no stale working state (FR-006)" {
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var hrep = state.FakeHerdrReporter.init(alloc);
     defer hrep.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), fbs.writer().any(), "pane-a3", "goal-a3", "/wd/.ziki");
+    ex.publisher = state.StatePublisher.init(alloc, hrep.toReporter(), wsink.sink(), "pane-a3", "goal-a3", "/wd/.ziki");
 
     var goal = try runNoCriterion(alloc, &ex);
     defer goal.deinit(alloc);
@@ -310,7 +357,7 @@ test "A3 terminal idle push leaves no stale working state (FR-006)" {
     // The final published state must be idle (no stale working).
     const last = hrep.last orelse @panic("no report");
     try std.testing.expectEqualStrings("idle", last.state);
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     const last_working = lastIndexOf(written, "[ziki-state: working]");
     const last_idle = lastIndexOf(written, "[ziki-state: idle]");
     try std.testing.expect(last_idle > last_working);
@@ -325,20 +372,26 @@ test "A4 degraded mode (null reporter) still emits markers/OSC, no crash (FR-008
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     // reporter = null: no push path, but markers + OSC must still emit.
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    ex.publisher = state.StatePublisher.init(alloc, null, fbs.writer().any(), "pane-a4", "goal-a4", "/wd/.ziki");
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
+    ex.publisher = state.StatePublisher.init(alloc, null, wsink.sink(), "pane-a4", "goal-a4", "/wd/.ziki");
 
     var goal = try runNoCriterion(alloc, &ex);
     defer goal.deinit(alloc);
     defer if (ex.report) |r| alloc.free(r);
 
     try std.testing.expect(goal.status == .completed);
-    const written = buf[0..fbs.pos];
+    const written = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: working]") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ziki:working") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "[ziki-state: idle]") != null);
@@ -354,14 +407,20 @@ test "A5 seq is strictly increasing across rapid transitions (no stale report wi
     const tools = [_]Tool{};
 
     var ex = GoalExecutor{
-        .alloc = alloc, .provider = undefined, .tools = &tools,
-        .repo = repo, .fs = fake.toFs(), .dir = ".ziki", .session_id = "sess1",
+        .alloc = alloc,
+        .provider = undefined,
+        .tools = &tools,
+        .repo = repo,
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
     };
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
+    var wsink = state.WriterSink{ .w = &w };
     var rec = try RecordingReporter.init(alloc);
     defer rec.deinit();
-    ex.publisher = state.StatePublisher.init(alloc, rec.toReporter(), fbs.writer().any(), "pane-a5", "goal-a5", "/wd/.ziki");
+    ex.publisher = state.StatePublisher.init(alloc, rec.toReporter(), wsink.sink(), "pane-a5", "goal-a5", "/wd/.ziki");
 
     const responses = [_]provider.ChatResponse{
         .{ .message = .{ .role = .assistant, .content = "NO" } },

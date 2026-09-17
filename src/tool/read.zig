@@ -24,7 +24,7 @@ pub const ReadTool = struct {
             .name = "read_file",
             .description = "Read the contents of a file at the given path.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"}},"required":["path"]}
+            \\{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"}},"required":["path"]}
             ,
         };
     }

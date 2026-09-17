@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const provider = @import("../provider/provider.zig");
 const Tool = @import("../tool/tool.zig").Tool;
 const registry_mod = @import("registry.zig");
@@ -88,7 +89,7 @@ test "skill-driven goal e2e: disk skill, prompt listing, skill tool fetch, artif
     //    the loop runs against the real filesystem layout.
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_abs = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(tmp_abs);
     const skill_body = "1. read the checklist\n2. write deploy-log.txt\nDEPLOY STEPS BODY";
     const skill_md = try std.fmt.allocPrint(
@@ -97,8 +98,8 @@ test "skill-driven goal e2e: disk skill, prompt listing, skill tool fetch, artif
         .{skill_body},
     );
     defer alloc.free(skill_md);
-    try tmp.dir.makePath("skills/deploy");
-    try tmp.dir.writeFile(.{ .sub_path = "skills/deploy/SKILL.md", .data = skill_md });
+    try tmp.dir.createDirPath(compat.io(), "skills/deploy");
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "skills/deploy/SKILL.md", .data = skill_md });
 
     var realfs_impl = RealFs.init(tmp_abs);
     const disk_fs = realfs_impl.toFs();

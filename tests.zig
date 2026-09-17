@@ -1,6 +1,7 @@
 // Test aggregator. Importing each module pulls in its `test` declarations so
 // `zig build test` runs the whole suite. Add executor/cli/main as they land.
 const std = @import("std");
+const compat = @import("src/compat.zig");
 const fs = @import("src/fs/fs.zig");
 const goal = @import("src/goal/goal.zig");
 const repository = @import("src/goal/repository.zig");
@@ -11,6 +12,7 @@ const transport_tls = @import("src/provider/transport_tls.zig");
 const openai = @import("src/provider/openai.zig");
 const fake = @import("src/provider/fake.zig");
 const presets = @import("src/provider/presets.zig");
+const presets_test = @import("src/provider/presets_test.zig");
 const tool = @import("src/tool/tool.zig");
 const confine = @import("src/tool/confine.zig");
 const read = @import("src/tool/read.zig");
@@ -34,6 +36,7 @@ const e2e = @import("src/provider/e2e_test.zig");
 
 test "aggregator loads all modules" {
     _ = std.testing;
+    _ = compat;
     _ = fs;
     _ = goal;
     _ = repository;
@@ -44,6 +47,7 @@ test "aggregator loads all modules" {
     _ = openai;
     _ = fake;
     _ = presets;
+    _ = presets_test;
     _ = tool;
     _ = confine;
     _ = read;

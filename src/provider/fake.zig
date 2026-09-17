@@ -115,7 +115,7 @@ pub const RecordingProvider = struct {
     log: std.ArrayList(u8),
 
     pub fn init(alloc: Allocator, response: provider.ChatResponse) RecordingProvider {
-        return .{ .alloc = alloc, .response = response, .log = std.ArrayList(u8).initCapacity(alloc, 0) catch unreachable };
+        return .{ .alloc = alloc, .response = response, .log = .empty };
     }
     pub fn deinit(self: *RecordingProvider) void {
         self.log.deinit(self.alloc);

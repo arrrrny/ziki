@@ -1,12 +1,12 @@
 ---
-detected_at: 9376b03 # short SHA the profile was detected against
+detected_at: 018-migration # toolchain floor bumped to Zig 0.16.0 (spec 018, issue #21)
 ecosystems: [zig] # one entry per detected stack
 default: zig # which one the loop uses when a path is ambiguous
 stacks:
   zig:
     cwd: . # working directory every command below runs in
     runner: zig-test # Zig's built-in test framework (no third-party runner)
-    # --test-filter matches NOTHING in this Zig 0.15.2 build: it reports
+    # --test-filter matches NOTHING in this Zig 0.16.0 build: it reports
     # "All 0 tests passed" for every input, including the exact qualified
     # name `src.tool.bash.test.BashTool runs a command`. That is a silent
     # false-green, so it is unsafe. The loop must run the whole suite instead.
@@ -74,7 +74,7 @@ suite_seconds: 41 # observed wall time of the full suite (full compile + run)
 - Suite wall time is ~41s (full compile + run). A per-cycle full run is viable
   but slow (budget ~1 minute per check). There is no incremental/fast subset.
 - Coverage: available via `kcov` (installed v43 via `brew install kcov`, verified
-  on macOS 0.15.2). Verified command:
+  on macOS 0.16.0). Verified command:
   `kcov --include-pattern=src/ <out-dir> .zig-cache/o/<hash>/test` runs the full
   suite and emits HTML + `coverage.json`. Get the binary hash with
   `zig build test` then `ls -t .zig-cache/o/*/test | head -1`. Do NOT pass

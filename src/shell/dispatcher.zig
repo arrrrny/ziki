@@ -6,11 +6,15 @@ const Result = @import("intent.zig").Result;
 
 /// Routes a parsed `Intent` to the handler registered for its command. Contains
 /// zero command-specific logic (SC-005); it only performs a key lookup.
+/// (0.16: the managed `StringArrayHashMap` is gone; the unmanaged
+/// `array_hash_map.String` map is used, with the allocator captured at init so
+/// the public `init/register/dispatch/deinit` surface is unchanged.)
 pub const Dispatcher = struct {
-    handlers: std.StringArrayHashMap(Handler),
+    alloc: Allocator,
+    handlers: std.array_hash_map.String(Handler),
 
     pub fn init(alloc: Allocator) Dispatcher {
-        return .{ .handlers = std.StringArrayHashMap(Handler).init(alloc) };
+        return .{ .alloc = alloc, .handlers = std.array_hash_map.String(Handler).empty };
     }
 
     /// Register `handler` for `command`. Rejects a duplicate registration so
@@ -18,7 +22,7 @@ pub const Dispatcher = struct {
     /// the empty key `""` receives non-slash (message) lines.
     pub fn register(self: *Dispatcher, command: []const u8, handler: Handler) !void {
         if (self.handlers.contains(command)) return error.DuplicateHandler;
-        try self.handlers.put(command, handler);
+        try self.handlers.put(self.alloc, command, handler);
     }
 
     /// Route `intent` to its handler. Unknown command -> a clear "unknown
@@ -36,6 +40,6 @@ pub const Dispatcher = struct {
     }
 
     pub fn deinit(self: *Dispatcher) void {
-        self.handlers.deinit();
+        self.handlers.deinit(self.alloc);
     }
 };

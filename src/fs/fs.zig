@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 
 /// Expand a leading home-directory shorthand to the user's `$HOME`.
 ///
@@ -7,12 +8,12 @@ const Allocator = std.mem.Allocator;
 /// - `"~"` (bare)       -> `"$HOME"`
 /// - anything else      -> returned unchanged (caller-owned copy)
 ///
-/// The Zig stdlib has no `expandTilde`; we read `HOME` via
-/// `std.process.getEnvVarOwned`. When `HOME` is unset or the path does not
-/// start with `~`, the original path is returned (FR-001).
+/// The Zig stdlib has no `expandTilde`; we read `HOME` via `compat.getEnvOwned`
+/// (0.16 removed the process-global env accessors). When `HOME` is unset or the
+/// path does not start with `~`, the original path is returned (FR-001).
 pub fn expandTilde(alloc: Allocator, path: []const u8) ![]u8 {
     if (path.len == 0 or path[0] != '~') return alloc.dupe(u8, path);
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return alloc.dupe(u8, path);
+    const home = (compat.getEnvOwned(alloc, "HOME") catch null) orelse return alloc.dupe(u8, path);
     if (path.len == 1) {
         // bare "~" -> $HOME (fresh copy; `home` is freed, never returned).
         const dup = try alloc.dupe(u8, home);
@@ -115,7 +116,7 @@ pub const RealFs = struct {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         const abs = try self.resolve(alloc, path);
         defer alloc.free(abs);
-        return std.fs.cwd().readFileAlloc(alloc, abs, std.math.maxInt(usize)) catch |e| {
+        return std.Io.Dir.cwd().readFileAlloc(compat.io(), abs, alloc, .unlimited) catch |e| {
             if (e == error.FileNotFound) return error.FileNotFound;
             return e;
         };
@@ -124,22 +125,21 @@ pub const RealFs = struct {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         const abs = try self.resolve(alloc, path);
         defer alloc.free(abs);
-        var dir = std.fs.cwd();
-        if (std.fs.path.dirname(abs)) |d| try dir.makePath(d);
-        try std.fs.cwd().writeFile(.{ .sub_path = abs, .data = data });
+        if (std.fs.path.dirname(abs)) |d| try std.Io.Dir.cwd().createDirPath(compat.io(), d);
+        try std.Io.Dir.cwd().writeFile(compat.io(), .{ .sub_path = abs, .data = data });
     }
     fn exists(ctx: *anyopaque, path: []const u8) bool {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         const abs = self.resolve(std.heap.page_allocator, path) catch return false;
         defer std.heap.page_allocator.free(abs);
-        std.fs.cwd().access(abs, .{}) catch return false;
+        std.Io.Dir.cwd().access(compat.io(), abs, .{}) catch return false;
         return true;
     }
     fn remove(ctx: *anyopaque, path: []const u8) !void {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         const abs = try self.resolve(std.heap.page_allocator, path);
         defer std.heap.page_allocator.free(abs);
-        std.fs.cwd().deleteFile(abs) catch |e| {
+        std.Io.Dir.cwd().deleteFile(compat.io(), abs) catch |e| {
             if (e == error.FileNotFound) return error.FileNotFound;
             return e;
         };
@@ -149,24 +149,50 @@ pub const RealFs = struct {
         return self.cwd_path;
     }
     fn realpath(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![]u8 {
+        // Spec 018: 0.16's Io.Dir has no realpath, so symlinks are expanded
+        // component-by-component (left to right, bounded) with readLink; a
+        // path with no symlinks resolves lexically.
         const self: *RealFs = @ptrCast(@alignCast(ctx));
-        const abs = try self.resolve(alloc, path);
-        defer alloc.free(abs);
-        return std.fs.cwd().realpathAlloc(alloc, abs);
+        var current = try self.resolve(alloc, path);
+        const root_dir = std.Io.Dir.cwd();
+        var hops: usize = 0;
+        while (hops < 16) : (hops += 1) {
+            var found = false;
+            var idx: usize = 1;
+            while (idx <= current.len) : (idx += 1) {
+                if (idx < current.len and current[idx] != '/') continue;
+                const prefix = current[0..idx];
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = root_dir.readLink(compat.io(), prefix, &buf) catch continue;
+                const target = buf[0..n];
+                const rest = current[idx..];
+                const base_dir = std.fs.path.dirname(prefix) orelse "/";
+                const resolved = if (std.fs.path.isAbsolute(target))
+                    try std.fmt.allocPrint(alloc, "{s}{s}", .{ target, rest })
+                else
+                    try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ base_dir, target, rest });
+                alloc.free(current);
+                current = resolved;
+                found = true;
+                break;
+            }
+            if (!found) break;
+        }
+        return current;
     }
     fn readDir(ctx: *anyopaque, alloc: Allocator, path: []const u8) ![][]const u8 {
         const self: *RealFs = @ptrCast(@alignCast(ctx));
         const abs = try self.resolve(alloc, path);
         defer alloc.free(abs);
-        var dir = try std.fs.cwd().openDir(abs, .{ .iterate = true });
-        defer dir.close();
+        var dir = try std.Io.Dir.cwd().openDir(compat.io(), abs, .{ .iterate = true });
+        defer dir.close(compat.io());
         var names = try std.ArrayList([]const u8).initCapacity(alloc, 0);
         errdefer {
             for (names.items) |n| alloc.free(n);
             names.deinit(alloc);
         }
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(compat.io())) |entry| {
             try names.append(alloc, try alloc.dupe(u8, entry.name));
         }
         std.mem.sort([]const u8, names.items, {}, strLessThan);
@@ -303,8 +329,8 @@ test "RealFs round-trip via temp" {
     const tmp = std.testing.tmpDir(.{});
     const dir = tmp.dir;
     const path = "rt.txt";
-    try dir.writeFile(.{ .sub_path = path, .data = "hello" });
-    const got = try dir.readFileAlloc(std.testing.allocator, path, 1024);
+    try dir.writeFile(compat.io(), .{ .sub_path = path, .data = "hello" });
+    const got = try dir.readFileAlloc(compat.io(), path, std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("hello", got);
 }
@@ -324,11 +350,12 @@ test "FakeFs round-trip" {
 
 test "RealFs readDir lists direct entries" {
     const alloc = std.testing.allocator;
-    const tmp = std.testing.tmpDir(.{ .iterate = true });
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "x" });
-    try tmp.dir.makePath("sub");
-    try tmp.dir.writeFile(.{ .sub_path = "sub/b.txt", .data = "y" });
-    const abs = try tmp.dir.realpathAlloc(alloc, ".");
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "a.txt", .data = "x" });
+    try tmp.dir.createDirPath(compat.io(), "sub");
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "sub/b.txt", .data = "y" });
+    const abs = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(abs);
     var impl = RealFs.init(abs);
     const fs = impl.toFs();
@@ -374,7 +401,7 @@ test "expandTilde resolves ~ to $HOME" {
     const alloc = std.testing.allocator;
     // HOME is always set in this environment; derive the expected result from it
     // so the assertion is deterministic regardless of its concrete value.
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch {
+    const home = (compat.getEnvOwned(alloc, "HOME") catch null) orelse {
         // No HOME (e.g. some CI): expansion is a no-op; just confirm that.
         const same = try expandTilde(alloc, "~/foo");
         defer alloc.free(same);

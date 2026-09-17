@@ -34,18 +34,17 @@ fn usage(alloc: Allocator) ![]const u8 {
 fn listText(alloc: Allocator, registry: *const SkillRegistry) ![]const u8 {
     var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
     const skills = registry.list();
     if (skills.len == 0) {
-        try w.writeAll("no skills found — add SKILL.md files under .ziki/skills, .kimi-code/skills, or ~/.config/ziki/skills");
+        try buf.appendSlice(alloc, "no skills found — add SKILL.md files under .ziki/skills, .kimi-code/skills, or ~/.config/ziki/skills");
     } else {
-        try w.print("skills ({d}):\n", .{skills.len});
+        try buf.print(alloc, "skills ({d}):\n", .{skills.len});
         for (skills) |s| {
-            try w.print("  {s} — {s} ({s})\n", .{ s.name, s.description, s.source });
+            try buf.print(alloc, "  {s} — {s} ({s})\n", .{ s.name, s.description, s.source });
         }
     }
     for (registry.warnings()) |warn| {
-        try w.print("warning: {s}\n", .{warn});
+        try buf.print(alloc, "warning: {s}\n", .{warn});
     }
     return buf.toOwnedSlice(alloc);
 }
@@ -53,16 +52,15 @@ fn listText(alloc: Allocator, registry: *const SkillRegistry) ![]const u8 {
 fn notFound(alloc: Allocator, registry: *const SkillRegistry, missing: []const u8) ![]const u8 {
     var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
-    try w.print("skill not found: {s}\n", .{missing});
+    try buf.print(alloc, "skill not found: {s}\n", .{missing});
     const skills = registry.list();
     if (skills.len == 0) {
-        try w.writeAll("no skills are currently loaded");
+        try buf.appendSlice(alloc, "no skills are currently loaded");
     } else {
-        try w.writeAll("available skills: ");
+        try buf.appendSlice(alloc, "available skills: ");
         for (skills, 0..) |s, i| {
-            if (i > 0) try w.writeAll(", ");
-            try w.writeAll(s.name);
+            if (i > 0) try buf.appendSlice(alloc, ", ");
+            try buf.appendSlice(alloc, s.name);
         }
     }
     return buf.toOwnedSlice(alloc);

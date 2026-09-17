@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const Tool = @import("tool.zig").Tool;
 const ToolResult = @import("tool.zig").ToolResult;
 const ToolSpec = @import("../provider/provider.zig").ToolSpec;
@@ -49,7 +50,7 @@ pub const BashTool = struct {
             .name = "run_command",
             .description = "Execute a shell command and return its combined output and exit code. Commands that hang are killed after a timeout.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+            \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
             ,
         };
     }
@@ -84,11 +85,12 @@ pub const BashTool = struct {
         }
 
         var argv = [_][]const u8{ "/bin/sh", "-c", parsed.value.command };
-        var child = std.process.Child.init(&argv, alloc);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        try child.spawn();
+        var child = try std.process.spawn(compat.io(), .{
+            .argv = &argv,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
 
         var was_aborted = false;
         const r = try runWithTimeout(alloc, &child, self.timeout_seconds, self.stop, &was_aborted);
@@ -374,10 +376,10 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
     var err_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer err_buf.deinit(alloc);
     // ChildProcess has no deinit() in this Zig version; close the pipe fds
-    // (and their wrapping std.fs.File buffers) explicitly to avoid leaking them.
+    // (and their wrapping file handles) explicitly to avoid leaking them.
     defer {
-        if (child.stdout) |s| s.close();
-        if (child.stderr) |e| e.close();
+        if (child.stdout) |s| s.close(compat.io());
+        if (child.stderr) |e| e.close(compat.io());
     }
 
     const out_fd = child.stdout.?.handle;
@@ -386,18 +388,18 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
     var err_done = false;
     var tmp: [4096]u8 = undefined;
 
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = compat.milliTimestamp();
     while (!out_done or !err_done) {
         // Mid-command abort (spec 013 T10): observe the stop signal inside the
         // poll loop and terminate the child promptly.
         if (stop) |p| {
             if (p.isStop()) {
                 was_aborted.* = true;
-                std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+                std.posix.kill(child.id.?, std.posix.SIG.TERM) catch {};
                 // Reap so the aborted command does not linger as a zombie with
                 // open pipe fds for the life of the session; SIGTERM's default
                 // action ends it promptly.
-                _ = child.wait() catch std.process.Child.Term{ .Exited = 1 };
+                _ = child.wait(compat.io()) catch std.process.Child.Term{ .exited = 1 };
                 return ToolResult{
                     .ok = false,
                     .error_message = try std.fmt.allocPrint(alloc, "run_command aborted by user", .{}),
@@ -408,11 +410,11 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
         // budget is `no_timeout` we never kill — long validation must complete
         // and its result be captured (FR-003).
         if (timeout_seconds != BashTool.no_timeout) {
-            const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - start_ms);
+            const elapsed_ms: u64 = @intCast(compat.milliTimestamp() - start_ms);
             if (elapsed_ms >= timeout_seconds * 1000) {
-                std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+                std.posix.kill(child.id.?, std.posix.SIG.TERM) catch {};
                 // Reap the timed-out child (no zombie / leaked fds).
-                _ = child.wait() catch std.process.Child.Term{ .Exited = 1 };
+                _ = child.wait(compat.io()) catch std.process.Child.Term{ .exited = 1 };
                 return ToolResult{
                     .ok = false,
                     .error_message = try std.fmt.allocPrint(alloc, "run_command timed out after {d}s", .{timeout_seconds}),
@@ -457,14 +459,14 @@ fn runWithTimeout(alloc: Allocator, child: *std.process.Child, timeout_seconds: 
         }
     }
 
-    const term = child.wait() catch std.process.Child.Term{ .Exited = 1 };
+    const term = child.wait(compat.io()) catch std.process.Child.Term{ .exited = 1 };
     const code: i64 = switch (term) {
-        .Exited => |c| c,
+        .exited => |c| c,
         else => -1,
     };
     const combined = try std.fmt.allocPrint(alloc, "exit={d}\n{s}{s}", .{ code, out_buf.items, err_buf.items });
     const ok = switch (term) {
-        .Exited => |c| c == 0,
+        .exited => |c| c == 0,
         else => false,
     };
     return ToolResult{ .ok = ok, .output = combined };
@@ -530,11 +532,12 @@ test "BashTool honors a custom timeout and no-timeout (FR-003)" {
 test "BashTool times out a hanging command" {
     const alloc = std.testing.allocator;
     var argv = [_][]const u8{ "/bin/sh", "-c", "sleep 5" };
-    var child = std.process.Child.init(&argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
     var ab0 = false;
     const r = try runWithTimeout(alloc, &child, 0, null, &ab0);
     try std.testing.expect(!r.ok);
@@ -547,11 +550,12 @@ test "BashTool captures large stderr without truncation" {
     // of reader threads) or a command with substantial stderr loses data.
     const alloc = std.testing.allocator;
     var argv = [_][]const u8{ "/bin/sh", "-c", "for i in $(seq 1 3000); do echo \"L$i\" 1>&2; done" };
-    var child = std.process.Child.init(&argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
     var ab30 = false;
     const r = try runWithTimeout(alloc, &child, 30, null, &ab30);
     defer {
@@ -569,11 +573,12 @@ test "BashTool captures merged 2>&1 piped output" {
     // this test suite again and hang the build.
     const alloc = std.testing.allocator;
     var argv = [_][]const u8{ "/bin/sh", "-c", "for i in $(seq 1 100); do echo S$i 1>&2; done 2>&1 | tail -3" };
-    var child = std.process.Child.init(&argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
     var ab30 = false;
     const r = try runWithTimeout(alloc, &child, 30, null, &ab30);
     defer {

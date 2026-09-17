@@ -119,7 +119,7 @@ const Capture = struct {
     alloc: Allocator,
     buf: std.ArrayList(u8),
     fn init(a: Allocator) !Capture {
-        return .{ .alloc = a, .buf = try std.ArrayList(u8).initCapacity(a, 0) };
+        return .{ .alloc = a, .buf = .empty };
     }
     fn writeFn(ctx_: *anyopaque, data: []const u8) void {
         const self: *Capture = @ptrCast(@alignCast(ctx_));
@@ -131,8 +131,7 @@ const capture_vtable = Output.VTable{ .write = Capture.writeFn };
 test "repl processes scripted input in order, skips empty, stops on EOF" {
     const a = std.testing.allocator;
     const input = "/help\n\n/provider kimi\n/stop\n";
-    var stream = std.io.fixedBufferStream(@as([]const u8, input));
-    const reader = stream.reader();
+    var reader = std.Io.Reader.fixed(input);
     var cap = try Capture.init(a);
     defer cap.buf.deinit(a);
     const out = Output{ .ctx = &cap, .vtable = &capture_vtable };
@@ -146,7 +145,7 @@ test "repl processes scripted input in order, skips empty, stops on EOF" {
     try d.register("provider", .{ .ctx = &st_prov, .vtable = &fake_vtable });
     try d.register("stop", .{ .ctx = &st_stop, .vtable = &fake_vtable });
 
-    try Repl.run(a, reader, out, &d, null);
+    try Repl.run(a, &reader, out, &d, null);
 
     // each command dispatched exactly once; empty line skipped
     try std.testing.expectEqual(@as(usize, 1), st_help.call_count);

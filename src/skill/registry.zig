@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const Fs = @import("../fs/fs.zig").Fs;
 const skill_mod = @import("skill.zig");
 const Skill = skill_mod.Skill;
@@ -14,7 +15,7 @@ pub const SkillRegistry = struct {
     warnings_list: std.ArrayList([]const u8),
 
     pub fn init(alloc: Allocator) SkillRegistry {
-        return .{ .alloc = alloc, .skills = .{}, .warnings_list = .{} };
+        return .{ .alloc = alloc, .skills = .empty, .warnings_list = .empty };
     }
 
     pub fn deinit(self: *SkillRegistry) void {
@@ -111,15 +112,15 @@ fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
 /// `$HOME/.config/ziki/skills`. The caller owns the returned slice and each
 /// path. When HOME is unset the user root is simply omitted.
 pub fn defaultRoots(alloc: Allocator, cwd: []const u8) ![][]const u8 {
-    var roots = std.ArrayList([]const u8){};
+    var roots = std.ArrayList([]const u8).empty;
     errdefer {
         for (roots.items) |r| alloc.free(r);
         roots.deinit(alloc);
     }
     try roots.append(alloc, try std.fmt.allocPrint(alloc, "{s}/.ziki/skills", .{cwd}));
     try roots.append(alloc, try std.fmt.allocPrint(alloc, "{s}/.kimi-code/skills", .{cwd}));
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch "";
-    defer alloc.free(home);
+    const home = (compat.getEnvOwned(alloc, "HOME") catch null) orelse "";
+    defer if (home.len > 0) alloc.free(home);
     if (home.len > 0) {
         try roots.append(alloc, try std.fmt.allocPrint(alloc, "{s}/.config/ziki/skills", .{home}));
     }
@@ -132,9 +133,8 @@ pub fn defaultRoots(alloc: Allocator, cwd: []const u8) ![][]const u8 {
 pub fn listingText(alloc: Allocator, registry: *const SkillRegistry) ![]const u8 {
     var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
     for (registry.list()) |s| {
-        try w.print("- {s}: {s}\n", .{ s.name, s.description });
+        try buf.print(alloc, "- {s}: {s}\n", .{ s.name, s.description });
     }
     return buf.toOwnedSlice(alloc);
 }

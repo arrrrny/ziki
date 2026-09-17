@@ -7,6 +7,7 @@
 //! through a symlink to a real location outside the root (fail closed).
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const Allocator = std.mem.Allocator;
 const Fs = @import("../fs/fs.zig").Fs;
 
@@ -189,19 +190,19 @@ test "confine detects a symlink escape via realpath and fails closed (A2)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const abs = try tmp.dir.realpathAlloc(alloc, ".");
+    const abs = try @import("../compat.zig").tmpDirPath(alloc, &tmp);
     defer alloc.free(abs);
 
     var impl = @import("../fs/fs.zig").RealFs.init(abs);
     const fs = impl.toFs();
 
     // A symlink inside the workspace pointing at a real location outside it.
-    try tmp.dir.symLink("/etc", "esc", .{});
+    try tmp.dir.symLink(compat.io(), "/etc", "esc", .{});
     try refusal(alloc, fs, "esc/hosts");
     try refusal(alloc, fs, "/etc/hosts");
 
     // In-root real file passes (write parent check path exercised too).
-    try tmp.dir.writeFile(.{ .sub_path = "ok.txt", .data = "x" });
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "ok.txt", .data = "x" });
     try allowed(alloc, fs, "ok.txt");
     try allowed(alloc, fs, "new/nested.txt"); // missing file: lexical + parent check only
 }

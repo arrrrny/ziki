@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const Allocator = std.mem.Allocator;
 const Tool = @import("tool.zig").Tool;
 const ToolResult = @import("tool.zig").ToolResult;
@@ -26,7 +27,7 @@ pub const SearchTool = struct {
             .name = "search_file",
             .description = "Find lines containing the given substring, in `path` (single file) or recursively under `dir` (bounded by `max_files`).",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"dir":{"type":"string"},"max_files":{"type":"integer","minimum":1,"maximum":256}},"required":["pattern"],"anyOf":[{"required":["path"]},{"required":["dir"]}]}
+            \\{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"dir":{"type":"string"},"max_files":{"type":"integer","minimum":1,"maximum":256}},"required":["pattern"],"anyOf":[{"required":["path"]},{"required":["dir"]}]}
             ,
         };
     }
@@ -65,7 +66,7 @@ pub const SearchTool = struct {
         while (line_iter.next()) |line| {
             line_no += 1;
             if (std.mem.indexOf(u8, line, parsed.value.pattern) != null) {
-                try std.fmt.format(out.writer(alloc), "{d}: {s}\n", .{ line_no, line });
+                try out.print(alloc, "{d}: {s}\n", .{ line_no, line });
             }
         }
         return ToolResult{ .ok = true, .output = try out.toOwnedSlice(alloc) };
@@ -86,7 +87,7 @@ fn searchOneFile(alloc: Allocator, fs: Fs, path: []const u8, pattern: []const u8
     while (line_iter.next()) |line| {
         line_no += 1;
         if (std.mem.indexOf(u8, line, pattern) != null) {
-            try std.fmt.format(out.writer(alloc), "{s}:{d}: {s}\n", .{ path, line_no, line });
+            try out.print(alloc, "{s}:{d}: {s}\n", .{ path, line_no, line });
         }
     }
     return true;
@@ -117,8 +118,24 @@ fn walkSearch(alloc: Allocator, fs: Fs, dir: []const u8, pattern: []const u8, bu
             continue;
         }
         if (try searchOneFile(alloc, fs, child, pattern, budget, out)) continue;
+        // Never follow a symlinked entry: escapes are refused above, and an
+        // in-root link would re-walk the same content and can cycle (the
+        // depth cap alone would let a cycle drain the file budget).
+        if (isSymlinkEntry(alloc, fs, dir, e, child)) continue;
         try walkSearch(alloc, fs, child, pattern, budget, noticed, out, depth + 1);
     }
+}
+
+/// True when `child` (entry `entry` under `dir`) is a symlink: its canonical
+/// form differs from the canonical parent plus the entry name.
+fn isSymlinkEntry(alloc: Allocator, fs: Fs, dir: []const u8, entry: []const u8, child: []const u8) bool {
+    const dir_real = fs.realpath(alloc, dir) catch return false;
+    defer alloc.free(dir_real);
+    const child_real = fs.realpath(alloc, child) catch return false;
+    defer alloc.free(child_real);
+    const want = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_real, entry }) catch return false;
+    defer alloc.free(want);
+    return !std.mem.eql(u8, child_real, want);
 }
 
 test "SearchTool finds matching lines" {
@@ -168,17 +185,17 @@ test "SearchTool dir walk skips symlink escapes and survives symlink cycles" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const abs = try tmp.dir.realpathAlloc(alloc, ".");
+    const abs = try @import("../compat.zig").tmpDirPath(alloc, &tmp);
     defer alloc.free(abs);
 
     var impl = @import("../fs/fs.zig").RealFs.init(abs);
     var st = SearchTool.init(impl.toFs());
     const t = st.toTool();
 
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/real.zig", .data = "needle here\n" });
-    try tmp.dir.symLink("/etc", "src/esc", .{}); // escape: refused, never read
-    try tmp.dir.symLink(".", "src/loop", .{}); // in-root cycle: depth-capped
+    try tmp.dir.createDirPath(compat.io(), "src");
+    try tmp.dir.writeFile(compat.io(), .{ .sub_path = "src/real.zig", .data = "needle here\n" });
+    try tmp.dir.symLink(compat.io(), "/etc", "src/esc", .{}); // escape: refused, never read
+    try tmp.dir.symLink(compat.io(), ".", "src/loop", .{}); // in-root cycle: depth-capped
 
     const r = try t.execute(alloc, "{\"dir\":\"src\",\"pattern\":\"needle\"}");
     defer alloc.free(r.output);

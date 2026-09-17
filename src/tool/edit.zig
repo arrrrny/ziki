@@ -24,13 +24,13 @@ pub const EditTool = struct {
             .name = "edit_file",
             .description = "Edit a file by `mode`: `replace` swaps the first occurrence of `old` with `new` (fails unless found exactly once), `create` makes a missing file with `new` as its content, `delete` removes the file.",
             .parameters_json_schema =
-                \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"mode":{"type":"string","enum":["replace","create","delete"]}},"required":["path","mode","new"]}
+            \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"mode":{"type":"string","enum":["replace","create","delete"]}},"required":["path","mode","new"]}
             ,
         };
     }
     fn execute(ctx: *anyopaque, alloc: Allocator, args_json: []const u8) !ToolResult {
         const self: *EditTool = @ptrCast(@alignCast(ctx));
-        const Args = struct { path: []const u8, old: []const u8 = "", @"new": []const u8 = "", mode: []const u8 = "replace" };
+        const Args = struct { path: []const u8, old: []const u8 = "", new: []const u8 = "", mode: []const u8 = "replace" };
         var parsed = try std.json.parseFromSlice(Args, alloc, args_json, .{});
         defer parsed.deinit();
 
@@ -44,7 +44,7 @@ pub const EditTool = struct {
             if (self.fs.exists(parsed.value.path)) {
                 return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file create: already exists: {s}", .{parsed.value.path}) };
             }
-            self.fs.writeFile(alloc, parsed.value.path, parsed.value.@"new") catch |e| {
+            self.fs.writeFile(alloc, parsed.value.path, parsed.value.new) catch |e| {
                 return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file create failed: {s}", .{@errorName(e)}) };
             };
             return ToolResult{ .ok = true, .output = try std.fmt.allocPrint(alloc, "created {s}", .{parsed.value.path}) };
@@ -77,7 +77,7 @@ pub const EditTool = struct {
         if (count != 1) {
             return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file expected exactly 1 match, found {d}", .{count}) };
         }
-        const replaced = try std.mem.replaceOwned(u8, alloc, original, parsed.value.old, parsed.value.@"new");
+        const replaced = try std.mem.replaceOwned(u8, alloc, original, parsed.value.old, parsed.value.new);
         defer alloc.free(replaced);
         self.fs.writeFile(alloc, parsed.value.path, replaced) catch |e| {
             return ToolResult{ .ok = false, .error_message = try std.fmt.allocPrint(alloc, "edit_file write failed: {s}", .{@errorName(e)}) };

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
 const state = @import("state.zig");
 const provider = @import("../provider/provider.zig");
 const Tool = @import("../tool/tool.zig").Tool;
@@ -67,7 +68,7 @@ pub const GoalExecutor = struct {
     fn logLine(alloc: Allocator, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.allocPrint(alloc, fmt ++ "\n", args) catch return;
         defer alloc.free(s);
-        std.fs.File.stdout().writeAll(s) catch {};
+        std.Io.File.stdout().writeStreamingAll(compat.io(), s) catch {};
     }
 
     /// Owns `goal.progress` as a heap slice: frees the previous value before
@@ -97,6 +98,30 @@ pub const GoalExecutor = struct {
     /// Move the goal into a terminal state: status + progress + publisher +
     /// persist. Conversation history is cleared for terminal goals so the
     /// session's next goal never replays a foreign transcript.
+    /// Spec 014 US3/US4: turn credential/model rejections into a blocked goal
+    /// with actionable text (no key material, gateway hint when available).
+    /// Returns true when `e` was handled and the goal is finished.
+    fn finishProviderBlocked(self: *GoalExecutor, goal: *Goal, e: anyerror) !bool {
+        switch (e) {
+            error.Unauthorized, error.Forbidden => {
+                try self.finish(goal, .blocked, "provider rejected credentials (401/403) — check your API key or quota", "provider rejected credentials", "provider rejected credentials (401/403)");
+                return true;
+            },
+            error.ModelNotFound => {
+                // Both branches allocate so one cleanup path covers the hinted
+                // and hintless messages.
+                const msg: []u8 = if (self.provider.errorHint()) |h|
+                    try std.fmt.allocPrint(self.alloc, "model rejected by gateway — available models: {s}", .{h})
+                else
+                    try self.alloc.dupe(u8, "model rejected by gateway — check the model id against the gateway's model list");
+                defer self.alloc.free(msg);
+                try self.finish(goal, .blocked, msg, msg, "model rejected by gateway");
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     fn finish(self: *GoalExecutor, goal: *Goal, status: @import("../goal/goal.zig").Status, progress: []const u8, publisher_msg: ?[]const u8, skip: ?[]const u8) !void {
         goal.status = status;
         if (self.publisher != null) {
@@ -275,7 +300,7 @@ pub const GoalExecutor = struct {
                     stopped = true;
                     break;
                 }
-                std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                compat.sleepMs(poll_ms);
             }
             if (!io.done.load(.acquire)) {
                 // Abort grace: give the in-flight call a short window to finish
@@ -284,7 +309,7 @@ pub const GoalExecutor = struct {
                 // dies with the process. Socket-level cancel is out of scope.
                 var waited: u64 = 0;
                 while (!io.done.load(.acquire) and waited < grace_ms) {
-                    std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                    compat.sleepMs(poll_ms);
                     waited += poll_ms;
                 }
             }
@@ -297,11 +322,14 @@ pub const GoalExecutor = struct {
                 }
                 if (stopped or self.stopRequested()) return .aborted; // abort wins: discard
                 if (io.err) |e| {
+                    // Spec 014 US3/US4: credential and model rejections are
+                    // non-transient — no retry/backoff burn.
+                    if (e == error.Unauthorized or e == error.Forbidden or e == error.ModelNotFound) return e;
                     if (attempt + 1 == max_attempts) return e;
                     var slept: u64 = 0;
                     while (slept < 200) : (slept += poll_ms) {
                         if (self.stopRequested()) return .aborted;
-                        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                        compat.sleepMs(poll_ms);
                     }
                     continue;
                 }
@@ -318,22 +346,22 @@ pub const GoalExecutor = struct {
 
     fn systemPrompt(self: *GoalExecutor) ![]u8 {
         var sb = try std.ArrayList(u8).initCapacity(self.alloc, 0);
-        try sb.writer(self.alloc).writeAll(
+        try sb.appendSlice(self.alloc,
             \\You are an autonomous coding agent. Use the provided tools to pursue the user's goal.
             \\Call one tool at a time. When the goal is achieved, reply with a final message and no tool calls.
             \\
         );
         for (self.tools) |t| {
             const s = t.schema();
-            try std.fmt.format(sb.writer(self.alloc), "Tool {s}: {s}\n", .{ s.name, s.description });
+            try sb.print(self.alloc, "Tool {s}: {s}\n", .{ s.name, s.description });
         }
         if (self.skills_listing) |listing| {
             if (listing.len > 0) {
-                try sb.writer(self.alloc).writeAll(
+                try sb.appendSlice(self.alloc,
                     \\Skills you can consult — use the skill tool with the exact name to get its full instructions:
                     \\
                 );
-                try sb.writer(self.alloc).writeAll(listing);
+                try sb.appendSlice(self.alloc, listing);
             }
         }
         return sb.toOwnedSlice(self.alloc);
@@ -428,7 +456,7 @@ pub const GoalExecutor = struct {
 
         // Wall-clock budget carry (spec 013 D4) + cached default stop path.
         self.carried_seconds = goal.used.seconds;
-        self.run_start_ms = std.time.milliTimestamp();
+        self.run_start_ms = compat.milliTimestamp();
         if (self.stop_path) |p| self.alloc.free(p);
         self.stop_path = try std.fmt.allocPrint(self.alloc, "{s}/stop.{s}", .{ self.dir, self.session_id });
         defer {
@@ -487,7 +515,7 @@ pub const GoalExecutor = struct {
                 return;
             }
             // Time budget (spec 013 D4): persisted carry + this run's elapsed.
-            const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - self.run_start_ms));
+            const elapsed_ms: u64 = @intCast(@max(0, compat.milliTimestamp() - self.run_start_ms));
             goal.used.seconds = self.carried_seconds + elapsed_ms / 1000;
             if (goal.used.seconds >= goal.budgets.max_seconds) {
                 try self.finish(goal, .aborted, "aborted: time budget exceeded", "aborted: time budget exceeded", "aborted: time budget exceeded");
@@ -503,7 +531,10 @@ pub const GoalExecutor = struct {
             if (self.verbose) logLine(self.alloc, "verbose: turn {d}: requesting model ({d} msgs)", .{ goal.used.turns, messages.items.len });
 
             const specs = try self.toolSpecs(a);
-            const outcome = try self.completeInterruptible(a, .{ .messages = messages.items, .tools = specs });
+            const outcome = self.completeInterruptible(a, .{ .messages = messages.items, .tools = specs }) catch |e| {
+                if (try self.finishProviderBlocked(goal, e)) return;
+                return e;
+            };
             const resp = switch (outcome) {
                 .aborted => {
                     // Abort wins: the in-flight (or late) response is discarded,
@@ -518,6 +549,16 @@ pub const GoalExecutor = struct {
             // Token accounting (spec 013 D2): reported usage when the backend
             // supplies it, estimated conversation cost otherwise.
             goal.used.tokens += if (resp.usage) |u| u.total() else estimateTokens(messages.items);
+
+            // Spec 014 US2: surface non-terminal finish reasons so a truncated
+            // or cut-off turn is never silently treated as a complete stop.
+            switch (resp.finish_reason) {
+                .length => try self.addSkip("model output truncated (finish_reason=length)"),
+                .unknown => try self.addSkip("unknown finish_reason reported by the backend"),
+                .tool_calls => if (resp.message.tool_calls == null or resp.message.tool_calls.?.len == 0)
+                    try self.addSkip("tool call cut off (finish_reason=tool_calls without calls)"),
+                .stop => {},
+            }
 
             if (self.verbose) {
                 if (resp.message.tool_calls) |tcs| {
@@ -581,7 +622,13 @@ pub const GoalExecutor = struct {
             }
 
             if (goal.criterion) |crit| {
-                const satisfied = (try self.verify(a, goal, &messages, crit, false)) orelse {
+                // Spec 014 US3/US4: a credential/model rejection during
+                // criterion verification blocks the goal exactly like the main
+                // turn loop does — never escapes as a bare error.
+                const satisfied = (self.verify(a, goal, &messages, crit, false) catch |e| {
+                    if (try self.finishProviderBlocked(goal, e)) return;
+                    return e;
+                }) orelse {
                     // Stop observed during verification I/O: same graceful
                     // abort as the main path.
                     if (self.stop_path) |p| self.fs.remove(p) catch {};
@@ -622,7 +669,7 @@ pub const GoalExecutor = struct {
 
     /// Append a human-readable reason something was skipped (FR-006).
     fn addSkip(self: *GoalExecutor, msg: []const u8) !void {
-        try std.fmt.format(self.skipped.writer(self.alloc), "{s}\n", .{msg});
+        try self.skipped.print(self.alloc, "{s}\n", .{msg});
     }
 
     /// Snapshot paths already modified/untracked before the run (FR-005 safety).
@@ -647,7 +694,7 @@ pub const GoalExecutor = struct {
         } else {
             var it = self.intentional.keyIterator();
             while (it.next()) |k| {
-                try std.fmt.format(sb.writer(self.alloc), "  {s}\n", .{k.*});
+                try sb.print(self.alloc, "  {s}\n", .{k.*});
             }
         }
 
@@ -658,7 +705,7 @@ pub const GoalExecutor = struct {
             var it = std.mem.splitScalar(u8, self.skipped.items, '\n');
             while (it.next()) |line| {
                 if (line.len == 0) continue;
-                try std.fmt.format(sb.writer(self.alloc), "  {s}\n", .{line});
+                try sb.print(self.alloc, "  {s}\n", .{line});
             }
         }
 
@@ -670,7 +717,7 @@ pub const GoalExecutor = struct {
                 var it = std.mem.splitScalar(u8, reverted, '\n');
                 while (it.next()) |line| {
                     if (line.len == 0) continue;
-                    try std.fmt.format(sb.writer(self.alloc), "  {s}\n", .{line});
+                    try sb.print(self.alloc, "  {s}\n", .{line});
                 }
             }
         }
@@ -694,17 +741,18 @@ pub const GoalExecutor = struct {
 /// Used by the FR-005 tree-cleanup helpers; failures are non-fatal (the cleanup
 /// is best-effort and must never crash the goal loop).
 fn runCapture(alloc: Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return alloc.dupe(u8, "");
+    var child = std.process.spawn(compat.io(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return alloc.dupe(u8, "");
     // ChildProcess has no deinit() in this Zig version, so the pipe fds (and the
-    // std.fs.File buffers wrapping them) leak when `child` leaves scope. Close
-    // them explicitly on every return path.
+    // files wrapping them) leak when `child` leaves scope. Close them explicitly
+    // on every return path.
     defer {
-        if (child.stdout) |s| s.close();
-        if (child.stderr) |e| e.close();
+        if (child.stdout) |s| s.close(compat.io());
+        if (child.stderr) |e| e.close(compat.io());
     }
     const fd = child.stdout.?.handle;
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
@@ -712,17 +760,17 @@ fn runCapture(alloc: Allocator, argv: []const []const u8) ![]u8 {
     while (true) {
         const n = std.posix.read(fd, &tmp) catch {
             out.deinit(alloc);
-            _ = child.wait() catch unreachable;
+            _ = child.wait(compat.io()) catch unreachable;
             return alloc.dupe(u8, "");
         };
         if (n == 0) break;
         out.appendSlice(alloc, tmp[0..n]) catch {
             out.deinit(alloc);
-            _ = child.wait() catch unreachable;
+            _ = child.wait(compat.io()) catch unreachable;
             return alloc.dupe(u8, "");
         };
     }
-    _ = child.wait() catch unreachable;
+    _ = child.wait(compat.io()) catch unreachable;
     return out.toOwnedSlice(alloc);
 }
 
@@ -776,7 +824,7 @@ fn revertIncidental(alloc: Allocator, cwd: []const u8, intentional: *const Inten
             const argv = [_][]const u8{ "git", "-C", cwd, "checkout", "HEAD", "--", sp.path };
             if (runCapture(alloc, &argv)) |cap| alloc.free(cap) else |_| {}
         }
-        try std.fmt.format(reverted.writer(alloc), "{s}\n", .{sp.path});
+        try reverted.print(alloc, "{s}\n", .{sp.path});
     }
     return reverted.toOwnedSlice(alloc);
 }
@@ -966,7 +1014,7 @@ test "revertIncidental reverts only drift, not pre-existing or intentional" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     const dir = tmp.dir;
-    const cwd = try dir.realpathAlloc(alloc, ".");
+    const cwd = try compat.tmpDirPath(alloc, &tmp);
     defer alloc.free(cwd);
     defer tmp.cleanup();
 
@@ -974,15 +1022,15 @@ test "revertIncidental reverts only drift, not pre-existing or intentional" {
     try runGit(alloc, cwd, &.{ "init", "-q" });
     try runGit(alloc, cwd, &.{ "config", "user.email", "test@example.com" });
     try runGit(alloc, cwd, &.{ "config", "user.name", "test" });
-    try dir.writeFile(.{ .sub_path = "tracked.txt", .data = "original" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "tracked.txt", .data = "original" });
     try runGit(alloc, cwd, &.{ "add", "tracked.txt" });
     try runGit(alloc, cwd, &.{ "commit", "-q", "-m", "init" });
 
     // a pre-existing untracked file the user already had (must survive cleanup)
-    try dir.writeFile(.{ .sub_path = "preexisting.txt", .data = "mine" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "preexisting.txt", .data = "mine" });
     // drift introduced during the run: a modified tracked file + a stray untracked file
-    try dir.writeFile(.{ .sub_path = "tracked.txt", .data = "DRIFT" });
-    try dir.writeFile(.{ .sub_path = "stray.txt", .data = "oops" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "tracked.txt", .data = "DRIFT" });
+    try dir.writeFile(compat.io(), .{ .sub_path = "stray.txt", .data = "oops" });
 
     var pre = IntentionalMap.init(alloc);
     defer {
@@ -1009,12 +1057,12 @@ test "revertIncidental reverts only drift, not pre-existing or intentional" {
     try std.testing.expect(std.mem.indexOf(u8, reverted, "preexisting.txt") == null);
 
     // On disk: tracked reverted to original, stray gone, preexisting kept.
-    const t = try dir.readFileAlloc(alloc, "tracked.txt", 64);
+    const t = try dir.readFileAlloc(compat.io(), "tracked.txt", alloc, .limited(64));
     defer alloc.free(t);
     try std.testing.expectEqualStrings("original", t);
     // stray.txt was incidental untracked drift and must be removed by cleanup.
-    try std.testing.expect(dir.access("stray.txt", .{}) == error.FileNotFound);
-    const p = try dir.readFileAlloc(alloc, "preexisting.txt", 64);
+    try std.testing.expect(dir.access(compat.io(), "stray.txt", .{}) == error.FileNotFound);
+    const p = try dir.readFileAlloc(compat.io(), "preexisting.txt", alloc, .limited(64));
     defer alloc.free(p);
     try std.testing.expectEqualStrings("mine", p);
 }
@@ -1110,6 +1158,7 @@ test "system prompt is unchanged when no skills listing is set (FR-010)" {
 
 // ---------------------------------------------------------------------------
 // spec 013 tests: budgets, compaction, abort, resume seeding.
+
 // ---------------------------------------------------------------------------
 
 const fake13 = @import("../provider/fake.zig");
@@ -1437,7 +1486,7 @@ test "provider response arriving after the signal is discarded (B13)" {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             self.probe.raise();
-            std.Thread.sleep(150 * std.time.ns_per_ms);
+            compat.sleepMs(150);
             const tcs = [_]provider.ToolCall{.{ .id = "c9", .name = "write_file", .arguments_json = "{\"path\":\"late.txt\",\"data\":\"x\"}" }};
             return provider.ChatResponse{
                 .message = .{ .role = .assistant, .content = "", .tool_calls = try pa.dupe(provider.ToolCall, &tcs) },
@@ -1782,7 +1831,8 @@ test "executor propagates a failed tool's error_message into the conversation (A
 }
 
 // ---------------------------------------------------------------------------
-// Tests: already-applied detection + job report completeness (spec 016).
+// Tests: already-applied detection + job report completeness (spec 016),
+//        finish_reason surfacing + credential/model rejection (spec 014).
 // ---------------------------------------------------------------------------
 
 /// Minimal counting provider: scripted responses in order (repeats the last),
@@ -1823,6 +1873,100 @@ const CountingProvider = struct {
         return .{ .message = .{ .role = r.message.role, .content = try alloc.dupe(u8, r.message.content), .tool_calls = tcs }, .finish_reason = r.finish_reason };
     }
 };
+
+const StubOutcome = union(enum) {
+    ok: provider.ChatResponse,
+    err: anyerror,
+};
+
+/// Scripted provider returning a fixed outcome per call (repeats the last);
+/// counts calls so the test can assert no retry burn; optional error hint.
+const StubProvider = struct {
+    outcomes: []const StubOutcome,
+    idx: usize = 0,
+    calls: usize = 0,
+    hint: ?[]const u8 = null,
+
+    fn init(outcomes: []const StubOutcome) StubProvider {
+        return .{ .outcomes = outcomes };
+    }
+    fn toProvider(self: *StubProvider) provider.Provider {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable = provider.Provider.VTable{ .complete = complete, .name = name, .error_hint = errorHint };
+
+    fn name(_: *anyopaque) []const u8 {
+        return "stub";
+    }
+    fn errorHint(ctx: *anyopaque) ?[]const u8 {
+        const self: *StubProvider = @ptrCast(@alignCast(ctx));
+        return self.hint;
+    }
+    fn complete(ctx: *anyopaque, alloc: Allocator, _: provider.CompletionRequest) anyerror!provider.ChatResponse {
+        const self: *StubProvider = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const o = self.outcomes[@min(self.idx, self.outcomes.len - 1)];
+        if (self.idx + 1 < self.outcomes.len) self.idx += 1;
+        switch (o) {
+            .err => |e| return e,
+            .ok => |r| {
+                var tcs: ?[]provider.ToolCall = null;
+                if (r.message.tool_calls) |src| {
+                    const owned = try alloc.alloc(provider.ToolCall, src.len);
+                    for (src, 0..) |tc, i| {
+                        owned[i] = .{
+                            .id = try alloc.dupe(u8, tc.id),
+                            .name = try alloc.dupe(u8, tc.name),
+                            .arguments_json = try alloc.dupe(u8, tc.arguments_json),
+                        };
+                    }
+                    tcs = owned;
+                }
+                return .{ .message = .{ .role = r.message.role, .content = try alloc.dupe(u8, r.message.content), .tool_calls = tcs }, .finish_reason = r.finish_reason };
+            },
+        }
+    }
+};
+
+const StubHarness = struct {
+    fake: *(@import("../fs/fs.zig").FakeFs),
+    repo_impl: *(@import("../goal/repository.zig").FsGoalRepository),
+    ex: *GoalExecutor,
+    goal: *@import("../goal/goal.zig").Goal,
+
+    fn deinit(self: *StubHarness, alloc: Allocator) void {
+        self.goal.deinit(alloc);
+        alloc.destroy(self.goal);
+        if (self.ex.report) |r| alloc.free(r);
+        alloc.destroy(self.ex);
+        alloc.destroy(self.repo_impl);
+        self.fake.deinit();
+        alloc.destroy(self.fake);
+    }
+};
+
+fn runStubGoal(alloc: Allocator, sp: *StubProvider) !StubHarness {
+    const FakeFs = @import("../fs/fs.zig").FakeFs;
+    const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
+    const fake = try alloc.create(FakeFs);
+    fake.* = FakeFs.init(alloc, "/wd");
+    const tools = [_]Tool{};
+    const repo_impl = try alloc.create(FsGoalRepository);
+    repo_impl.* = FsGoalRepository.init(fake.toFs(), ".ziki", "sess1");
+    const ex = try alloc.create(GoalExecutor);
+    ex.* = GoalExecutor{
+        .alloc = alloc,
+        .provider = sp.toProvider(),
+        .tools = &tools,
+        .repo = repo_impl.toRepository(),
+        .fs = fake.toFs(),
+        .dir = ".ziki",
+        .session_id = "sess1",
+    };
+    const goal = try alloc.create(@import("../goal/goal.zig").Goal);
+    goal.* = try @import("../goal/goal.zig").Goal.init(alloc, "stub objective", null, "sess1");
+    return .{ .fake = fake, .repo_impl = repo_impl, .ex = ex, .goal = goal };
+}
 
 test "already-satisfied criterion short-circuits before provider turns (A2)" {
     const alloc = std.testing.allocator;
@@ -2042,4 +2186,61 @@ test "job report covers intentional, untracked, and reverted paths (A3)" {
     try std.testing.expect(std.mem.indexOf(u8, r, "user-notes") == null);
     try std.testing.expect(fs.exists("intentional-new.txt"));
     try std.testing.expect(!fs.exists("drift-file.txt"));
+}
+
+test "finish_reason length/unknown/tool-cutoff are surfaced, not silent stops (A2)" {
+    const alloc = std.testing.allocator;
+    // Truncated answer: surfaced as a job-report note, loop still terminates.
+    {
+        const outs = [_]StubOutcome{.{ .ok = .{ .message = .{ .role = .assistant, .content = "partial" }, .finish_reason = .length } }};
+        var sp = StubProvider.init(&outs);
+        var g = try runStubGoal(alloc, &sp);
+        defer g.deinit(alloc);
+        try g.ex.run(g.goal);
+        try std.testing.expect(g.goal.status == .completed);
+        try std.testing.expect(std.mem.indexOf(u8, g.ex.report.?, "truncated") != null);
+    }
+    // Unknown finish_reason: distinct state, surfaced.
+    {
+        const outs = [_]StubOutcome{.{ .ok = .{ .message = .{ .role = .assistant, .content = "hm" }, .finish_reason = .unknown } }};
+        var sp = StubProvider.init(&outs);
+        var g = try runStubGoal(alloc, &sp);
+        defer g.deinit(alloc);
+        try g.ex.run(g.goal);
+        try std.testing.expect(std.mem.indexOf(u8, g.ex.report.?, "unknown finish_reason") != null);
+    }
+    // Tool-call cutoff: finish_reason says tool_calls but no calls arrived.
+    {
+        const outs = [_]StubOutcome{.{ .ok = .{ .message = .{ .role = .assistant, .content = "" }, .finish_reason = .tool_calls } }};
+        var sp = StubProvider.init(&outs);
+        var g = try runStubGoal(alloc, &sp);
+        defer g.deinit(alloc);
+        try g.ex.run(g.goal);
+        try std.testing.expect(std.mem.indexOf(u8, g.ex.report.?, "cut off") != null);
+    }
+}
+
+test "credential rejection finishes blocked, fail-fast, no key material (A3)" {
+    const alloc = std.testing.allocator;
+    const outs = [_]StubOutcome{.{ .err = error.Unauthorized }};
+    var sp = StubProvider.init(&outs);
+    var g = try runStubGoal(alloc, &sp);
+    defer g.deinit(alloc);
+    try g.ex.run(g.goal);
+    try std.testing.expect(g.goal.status == .blocked);
+    try std.testing.expect(std.mem.indexOf(u8, g.goal.progress, "credentials") != null);
+    try std.testing.expectEqual(@as(usize, 1), sp.calls); // no retry burn
+}
+
+test "model rejection finishes blocked including the gateway hint (A4)" {
+    const alloc = std.testing.allocator;
+    const outs = [_]StubOutcome{.{ .err = error.ModelNotFound }};
+    var sp = StubProvider.init(&outs);
+    sp.hint = "m-a, m-b";
+    var g = try runStubGoal(alloc, &sp);
+    defer g.deinit(alloc);
+    try g.ex.run(g.goal);
+    try std.testing.expect(g.goal.status == .blocked);
+    try std.testing.expect(std.mem.indexOf(u8, g.goal.progress, "m-a, m-b") != null);
+    try std.testing.expectEqual(@as(usize, 1), sp.calls);
 }
