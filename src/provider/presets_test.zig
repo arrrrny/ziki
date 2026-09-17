@@ -28,7 +28,7 @@ const CapturingTransport = struct {
     };
 
     fn init(alloc: Allocator, responses: []const HttpResponse) CapturingTransport {
-        return .{ .alloc = alloc, .calls = .{}, .responses = responses };
+        return .{ .alloc = alloc, .calls = .empty, .responses = responses };
     }
     fn toTransport(self: *CapturingTransport) Transport {
         return .{ .ctx = self, .vtable = &vtable };

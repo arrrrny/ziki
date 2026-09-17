@@ -2104,7 +2104,7 @@ test "job report covers intentional, untracked, and reverted paths (A3)" {
     const FsGoalRepository = @import("../goal/repository.zig").FsGoalRepository;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
 
     // Real repo so the drift revert (git clean) operates for real.
@@ -2114,21 +2114,23 @@ test "job report covers intentional, untracked, and reverted paths (A3)" {
             defer argv.deinit(a);
             argv.appendSlice(a, &.{ "git", "-C", dir }) catch return;
             argv.appendSlice(a, args) catch return;
-            var child = std.process.Child.init(argv.items, a);
-            child.stdin_behavior = .Ignore;
-            child.stdout_behavior = .Ignore;
-            child.stderr_behavior = .Ignore;
-            _ = child.spawnAndWait() catch {};
+            var child = std.process.spawn(std.testing.io, .{
+                .argv = argv.items,
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+            }) catch return;
+            _ = child.wait(std.testing.io) catch {};
         }
     };
     run.git(alloc, cwd, &.{ "init", "-q" });
     run.git(alloc, cwd, &.{ "config", "user.email", "t@t" });
     run.git(alloc, cwd, &.{ "config", "user.name", "t" });
-    try tmp.dir.writeFile(.{ .sub_path = "tracked.txt", .data = "base" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tracked.txt", .data = "base" });
     run.git(alloc, cwd, &.{ "add", "tracked.txt" });
     run.git(alloc, cwd, &.{ "commit", "-q", "-m", "init" });
     // Pre-existing untracked user file: must survive untouched, unreported.
-    try tmp.dir.writeFile(.{ .sub_path = "user-notes.txt", .data = "mine" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "user-notes.txt", .data = "mine" });
 
     var impl = @import("../fs/fs.zig").RealFs.init(cwd);
     const fs = impl.toFs();

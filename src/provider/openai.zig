@@ -74,7 +74,7 @@ pub const OpenAIProvider = struct {
         if (parsed.value != .object) return;
         const data = parsed.value.object.get("data") orelse return;
         if (data != .array) return;
-        var buf = std.ArrayList(u8){};
+        var buf = std.ArrayList(u8).initCapacity(alloc, 0) catch return;
         var count: usize = 0;
         for (data.array.items) |item| {
             if (item != .object) continue;
@@ -359,7 +359,7 @@ const CapTransport = struct {
     auths: std.ArrayList([]u8),
 
     fn init(alloc: Allocator, script: []const CapResp) CapTransport {
-        return .{ .alloc = alloc, .script = script, .methods = .{}, .urls = .{}, .auths = .{} };
+        return .{ .alloc = alloc, .script = script, .methods = .empty, .urls = .empty, .auths = .empty };
     }
     fn toTransport(self: *CapTransport) Transport {
         return .{ .ctx = self, .vtable = &vtable };
