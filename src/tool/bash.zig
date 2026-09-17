@@ -324,16 +324,16 @@ fn isAssignmentPrefix(tok: []const u8) bool {
 /// listed is treated as a possible alias for a push (fail closed).
 fn isKnownSafeGitSub(s: []const u8) bool {
     const safe = [_][]const u8{
-        "status",   "log",     "diff",     "show",         "add",       "commit",
-        "mv",       "rm",      "stash",    "branch",       "tag",       "checkout",
-        "switch",   "restore", "merge",    "rebase",       "fetch",     "config",
-        "remote",   "blame",   "describe", "rev-parse",    "clean",     "apply",
-        "cherry-pick", "revert", "reset",  "grep",         "ls-files",  "ls-remote",
-        "worktree", "gc",      "fsck",     "notes",        "archive",   "bundle",
-        "cat-file", "check-ignore",       "init",         "clone",     "help",
-        "version",  "reflog",  "merge-base", "shortlog",   "bisect",    "submodule",
-        "ls-tree",  "rev-list", "show-branch", "symbolic-ref", "whatchanged",
-        "format-patch", "difftool", "var",  "count-objects", "maintenance",
+        "status",      "log",           "diff",         "show",        "add",          "commit",
+        "mv",          "rm",            "stash",        "branch",      "tag",          "checkout",
+        "switch",      "restore",       "merge",        "rebase",      "fetch",        "config",
+        "remote",      "blame",         "describe",     "rev-parse",   "clean",        "apply",
+        "cherry-pick", "revert",        "reset",        "grep",        "ls-files",     "ls-remote",
+        "worktree",    "gc",            "fsck",         "notes",       "archive",      "bundle",
+        "cat-file",    "check-ignore",  "init",         "clone",       "help",         "version",
+        "reflog",      "merge-base",    "shortlog",     "bisect",      "submodule",    "ls-tree",
+        "rev-list",    "show-branch",   "symbolic-ref", "whatchanged", "format-patch", "difftool",
+        "var",         "count-objects", "maintenance",
     };
     for (safe) |k| {
         if (std.mem.eql(u8, s, k)) return true;
